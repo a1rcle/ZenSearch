@@ -1,1 +1,0 @@
-# ZenSearch core module

@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Logs
+*.log
+ZenSearch.log
+
+# Temporary / Draft images
+logo_preview*.png
+logo_comparison*.png
+
+# Everything-SDK build artifacts and IDE cache
+Everything-SDK/example/**/bin/
+Everything-SDK/example/**/obj/
+*.suo
+*.user
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# System and IDE
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

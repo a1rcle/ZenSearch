@@ -1,0 +1,217 @@
+import { LineEdit, ListView } from "std-widgets.slint";
+import { Theme } from "common.slint";
+
+export struct SearchItem {
+    filename: string,
+    path: string,
+    icon: image,
+}
+
+export component LauncherWindow inherits Window {
+    in-out property <string> search_text: "";
+    in-out property <bool> is_expanded: false;
+    in-out property <int> selected_index: 0;
+    in-out property <length> scroll_y: 0px;
+    in property <[SearchItem]> result_items: [];
+
+    callback query_changed(string);
+    callback item_activated(int);
+    callback item_open_folder(int);
+    callback dismiss();
+
+    public function ensure_selected_visible() {
+        let view_h = min(400px, root.result_items.length * 52px);
+        let item_top = root.selected_index * 50px;
+        let item_bottom = item_top + 50px;
+
+        if (item_top < -root.scroll_y) {
+            root.scroll_y = -item_top;
+        } else if (item_bottom > -root.scroll_y + view_h) {
+            root.scroll_y = view_h - item_bottom;
+        }
+    }
+
+    public function focus_input() {
+        search_input.focus();
+        search_input.set-selection-offsets(search_input.text.character-count, search_input.text.character-count);
+    }
+
+    public function reset_state() {
+        root.search_text = "";
+        root.is_expanded = false;
+        root.selected_index = 0;
+        root.scroll_y = 0px;
+        search_input.text = "";
+        search_input.focus();
+    }
+
+    title: "ZenSearch_Launcher";
+    no-frame: true;
+    background: transparent;
+    always-on-top: true;
+    default-font-family: "Segoe UI, Microsoft YaHei, sans-serif";
+
+    forward-focus: search_input;
+
+    Rectangle {
+        background: Theme.background;
+        border-radius: Theme.border-radius;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000088;
+        drop-shadow-offset-y: 8px;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 8px;
+
+            // Search Header Bar
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: center;
+                height: 40px;
+
+                // Search Icon
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: Theme.surface;
+
+                    Text {
+                        text: "🔍";
+                        font-size: 14px;
+                        color: Theme.primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // Input Box
+                search_input := LineEdit {
+                    text <=> root.search_text;
+                    placeholder-text: "ZenSearch 极速搜索 (Enter 打开, Ctrl+O 定位, Esc 退出)...";
+                    font-size: 15px;
+                    horizontal-stretch: 1;
+
+                    edited(text) => {
+                        root.selected_index = 0;
+                        root.scroll_y = 0px;
+                        root.query_changed(text);
+                    }
+
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.dismiss();
+                            return accept;
+                        }
+                        if (event.text == Key.UpArrow) {
+                            if (root.selected_index > 0) {
+                                root.selected_index -= 1;
+                                root.ensure_selected_visible();
+                            }
+                            return accept;
+                        }
+                        if (event.text == Key.DownArrow) {
+                            if (root.selected_index + 1 < root.result_items.length) {
+                                root.selected_index += 1;
+                                root.ensure_selected_visible();
+                            }
+                            return accept;
+                        }
+                        if (event.text == Key.Return) {
+                            if (root.result_items.length > 0 && root.selected_index >= 0 && root.selected_index < root.result_items.length) {
+                                root.item_activated(root.selected_index);
+                            }
+                            return accept;
+                        }
+                        if (event.modifiers.control && (event.text == "o" || event.text == "O")) {
+                            if (root.result_items.length > 0 && root.selected_index >= 0 && root.selected_index < root.result_items.length) {
+                                root.item_open_folder(root.selected_index);
+                            }
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+
+            // Results List
+            if root.is_expanded : VerticalLayout {
+                height: min(400px, root.result_items.length * 52px);
+                spacing: 4px;
+
+                ListView {
+                    content-y <=> root.scroll_y;
+                    for item[idx] in root.result_items : Rectangle {
+                        height: 50px;
+                        border-radius: 8px;
+                        background: idx == root.selected_index ? Theme.surface-selected : (item_touch.has-hover ? Theme.surface-hover : Theme.surface);
+
+                        item_touch := TouchArea {
+                            clicked => {
+                                root.selected_index = idx;
+                                root.item_activated(idx);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            spacing: 10px;
+
+                            // File icon pill
+                            Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                y: 5px;
+                                border-radius: 6px;
+                                background: idx == root.selected_index ? #3E4256 : #2D303E;
+
+                                Image {
+                                    source: item.icon;
+                                    width: 18px;
+                                    height: 18px;
+                                    image-fit: contain;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: item.filename;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    color: idx == root.selected_index ? Theme.text : #E0E2EC;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: item.path;
+                                    font-size: 11px;
+                                    color: Theme.text-muted;
+                                    overflow: elide;
+                                }
+                            }
+
+                            if idx == root.selected_index : Text {
+                                text: "↵ 打开";
+                                font-size: 11px;
+                                color: Theme.accent;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

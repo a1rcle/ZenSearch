@@ -1,0 +1,201 @@
+import { LineEdit, ListView } from "std-widgets.slint";
+import { Theme } from "common.slint";
+import { SearchItem } from "launcher.slint";
+
+export component CompanionWindow inherits Window {
+    in-out property <string> search_text: "";
+    in-out property <string> scope_dir: "";
+    in-out property <bool> is_expanded: false;
+    in-out property <int> selected_index: 0;
+    in-out property <length> scroll_y: 0px;
+    in property <[SearchItem]> result_items: [];
+
+    callback query_changed(string);
+    callback item_activated(int);
+    callback item_open_folder(int);
+    callback dismiss();
+
+    public function ensure_selected_visible() {
+        let view_h = min(280px, root.result_items.length * 44px);
+        let item_top = root.selected_index * 42px;
+        let item_bottom = item_top + 42px;
+
+        if (item_top < -root.scroll_y) {
+            root.scroll_y = -item_top;
+        } else if (item_bottom > -root.scroll_y + view_h) {
+            root.scroll_y = view_h - item_bottom;
+        }
+    }
+
+    public function focus_input() {
+        comp_input.focus();
+        comp_input.set-selection-offsets(comp_input.text.character-count, comp_input.text.character-count);
+    }
+
+    public function reset_state() {
+        root.search_text = "";
+        root.is_expanded = false;
+        root.selected_index = 0;
+        root.scroll_y = 0px;
+        comp_input.text = "";
+        comp_input.focus();
+    }
+
+    title: "ZenSearch_Companion";
+    no-frame: true;
+    background: transparent;
+    always-on-top: true;
+    default-font-family: "Segoe UI, Microsoft YaHei, sans-serif";
+
+    forward-focus: comp_input;
+
+    Rectangle {
+        background: Theme.background;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #00000080;
+        drop-shadow-offset-y: 4px;
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 6px;
+
+            if root.is_expanded : VerticalLayout {
+                height: min(280px, root.result_items.length * 44px);
+                spacing: 2px;
+
+                ListView {
+                    content-y <=> root.scroll_y;
+                    for item[idx] in root.result_items : Rectangle {
+                        height: 42px;
+                        border-radius: 6px;
+                        background: idx == root.selected_index ? Theme.surface-selected : (comp_item_touch.has-hover ? Theme.surface-hover : Theme.surface);
+
+                        comp_item_touch := TouchArea {
+                            clicked => {
+                                root.selected_index = idx;
+                                root.item_activated(idx);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            spacing: 8px;
+
+                            Rectangle {
+                                width: 22px;
+                                height: 22px;
+                                y: 6px;
+                                border-radius: 4px;
+                                background: idx == root.selected_index ? #3E4256 : #2D303E;
+
+                                Image {
+                                    source: item.icon;
+                                    width: 16px;
+                                    height: 16px;
+                                    image-fit: contain;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 1px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: item.filename;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    color: idx == root.selected_index ? Theme.text : #E0E2EC;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: item.path;
+                                    font-size: 10px;
+                                    color: Theme.text-muted;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                height: 32px;
+
+                // Mini Folder Scope Tag
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 4px;
+                    background: Theme.surface;
+
+                    Text {
+                        text: "📁";
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                comp_input := LineEdit {
+                    text <=> root.search_text;
+                    placeholder-text: "随行搜索当前目录 (Esc 关闭)...";
+                    font-size: 13px;
+                    horizontal-stretch: 1;
+
+                    edited(text) => {
+                        root.selected_index = 0;
+                        root.scroll_y = 0px;
+                        root.query_changed(text);
+                    }
+
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.dismiss();
+                            return accept;
+                        }
+                        if (event.text == Key.UpArrow) {
+                            if (root.selected_index > 0) {
+                                root.selected_index -= 1;
+                                root.ensure_selected_visible();
+                            }
+                            return accept;
+                        }
+                        if (event.text == Key.DownArrow) {
+                            if (root.selected_index + 1 < root.result_items.length) {
+                                root.selected_index += 1;
+                                root.ensure_selected_visible();
+                            }
+                            return accept;
+                        }
+                        if (event.text == Key.Return) {
+                            if (root.result_items.length > 0 && root.selected_index >= 0 && root.selected_index < root.result_items.length) {
+                                root.item_activated(root.selected_index);
+                            }
+                            return accept;
+                        }
+                        if (event.modifiers.control && (event.text == "o" || event.text == "O")) {
+                            if (root.result_items.length > 0 && root.selected_index >= 0 && root.selected_index < root.result_items.length) {
+                                root.item_open_folder(root.selected_index);
+                            }
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+        }
+    }
+}
