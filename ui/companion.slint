@@ -78,6 +78,12 @@ export component CompanionWindow inherits Window {
                                 root.selected_index = idx;
                                 root.item_activated(idx);
                             }
+                            pointer-event(event) => {
+                                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                    root.selected_index = idx;
+                                    root.item_open_folder(idx);
+                                }
+                            }
                         }
 
                         HorizontalLayout {

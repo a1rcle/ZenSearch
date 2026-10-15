@@ -1,6 +1,6 @@
 # ZenSearch 极速搜索引擎与无状态主浮窗规范 (Search Engine & Launcher)
 
-> **文档版本**：v2.0 (Rust 原生重构版)  
+> **文档版本**：v2.0  
 > **更新时间**：2026-10-13  
 > **技术栈选型**：Rust 2021 + Slint UI + Everything-SDK (Rust FFI)  
 > **模块定位**：ZenSearch 的核心搜索入口，包含 Everything 原生 FFI 接入、随包内置守护拉起、无锁低级键盘钩子状态机、主搜索浮窗无状态清空机制以及候选列表键盘光标视口滚动跟随。  
@@ -10,16 +10,13 @@
 
 ## 一、 底层搜索引擎与 Everything-SDK 原生接入
 
-### 1. 为什么采用 Rust FFI 对接 Everything-SDK？
-* **免提权与进程解耦**：解析 NTFS USN 日志或 MFT 必须要求软件以系统管理员权限常驻，这会导致普通权限软件无法向其拖拽文件，且存在潜在安全边界风险。Everything 以轻量系统服务或独立进程常驻，ZenSearch 只需通过 IPC 原生通信。
-* **原生 FFI 零开销**：在 Rust 中通过 `extern "system"` 直接绑定 `Everything64.dll` 的导出符号，调用开销 $\le 10\text{ns}$，无需通过 Python 动态类型或运行时封装。
+### 1. 架构定位与零开销 FFI 绑定
+* **免提权与进程解耦**：解析 NTFS USN 日志或 MFT 要求系统管理员权限常驻，会导致权限隔离与安全边界问题。Everything 以轻量系统服务或独立进程常驻，ZenSearch 通过 IPC 原生通信解耦权限。
+* **原生 FFI 零开销**：在 Rust 中通过 `extern "system"` 直接绑定 `Everything64.dll` 的导出符号，调用开销 $\le 10\text{ns}$。
 
-### 2. Rust FFI 接口声明与调用范式 (`src/core/everything.rs`)
+### 2. Rust FFI 接口声明与规范常量 (`src/core/everything.rs`)
 
 ```rust
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-
 // 绑定 Everything64.dll C 导出函数
 #[link(name = "Everything64")]
 extern "system" {
@@ -27,30 +24,91 @@ extern "system" {
     fn Everything_SetRequestFlags(dwRequestFlags: u32);
     fn Everything_SetMax(dwMax: u32);
     fn Everything_SetSort(dwSortType: u32);
+    fn Everything_SetMatchPath(bEnable: i32);
+    fn Everything_SetMatchCase(bEnable: i32);
+    fn Everything_SetMatchWholeWord(bEnable: i32);
+    fn Everything_SetRegex(bEnable: i32);
     fn Everything_QueryW(bWait: i32) -> i32;
     fn Everything_GetNumResults() -> u32;
+    fn Everything_GetTotResults() -> u32;
     fn Everything_GetResultFullPathNameW(nIndex: u32, lpString: *mut u16, nMaxCount: u32) -> u32;
     fn Everything_GetLastError() -> u32;
 }
 
+// Everything 官方标准排序枚举常量
+pub const EVERYTHING_SORT_NAME_ASCENDING: u32 = 1;
+pub const EVERYTHING_SORT_PATH_ASCENDING: u32 = 3;
+pub const EVERYTHING_SORT_DATE_MODIFIED_DESCENDING: u32 = 14;
+pub const EVERYTHING_SORT_RUN_COUNT_DESCENDING: u32 = 20;
+```
+
+### 3. 数据模型与契约 (`SearchResult` 与 `QueryOutput`)
+
+系统采用 `QueryOutput` 结构封装检索响应，既携带候选列表，亦提供底层索引库的全局总命中数。通过实现 `Deref<Target = [SearchResult]>`，为上层 UI 调用方提供零成本切片访问体验：
+
+```rust
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: String,
     pub filename: String,
 }
 
-pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
-    let wide_query: Vec<u16> = OsStr::new(query).encode_wide().chain(std::iter::once(0)).collect();
+#[derive(Debug, Clone, Default)]
+pub struct QueryOutput {
+    pub results: Vec<SearchResult>,
+    pub total_matched: u32,
+}
+
+impl std::ops::Deref for QueryOutput {
+    type Target = [SearchResult];
+    fn deref(&self) -> &Self::Target {
+        &self.results
+    }
+}
+```
+
+### 4. 检索执行管道与调度规范 (`execute_query`)
+
+```rust
+pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryOutput::default();
+    }
+
+    let wide_query: Vec<u16> = OsStr::new(trimmed)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // 智能全路径匹配判定：包含空格或路径分隔符时启用全路径比对，否则按纯文件名匹配
+    let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
+        1
+    } else {
+        0
+    };
+
     unsafe {
+        // 1. 状态彻底复位，保障查询独立性
+        Everything_SetMatchCase(0);
+        Everything_SetMatchWholeWord(0);
+        Everything_SetRegex(0);
+        Everything_SetMatchPath(enable_match_path);
+
+        // 2. 注入查询与请求字段
         Everything_SetSearchW(wide_query.as_ptr());
-        Everything_SetRequestFlags(0x00000001 | 0x00000002); // PATH | FILE_NAME
+        Everything_SetRequestFlags(0x00000001 | 0x00000002); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Everything_SetMax(max_results);
-        Everything_SetSort(13); // EVERYTHING_SORT_RUN_COUNT_DESCENDING
-        
+
+        // 3. 排序策略：修改日期降序（最新优先）
+        Everything_SetSort(EVERYTHING_SORT_DATE_MODIFIED_DESCENDING);
+
         if Everything_QueryW(1) != 0 {
             let count = Everything_GetNumResults();
+            let total_matched = Everything_GetTotResults();
             let mut results = Vec::with_capacity(count as usize);
             let mut buffer = [0u16; 1024];
-            
+
             for i in 0..count {
                 let len = Everything_GetResultFullPathNameW(i, buffer.as_mut_ptr(), 1024);
                 if len > 0 {
@@ -58,22 +116,42 @@ pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
                     let filename = std::path::Path::new(&path)
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                        .unwrap_or_else(|| path.clone());
                     results.push(SearchResult { path, filename });
                 }
             }
-            return results;
+            return QueryOutput { results, total_matched };
+        } else {
+            let err = Everything_GetLastError();
+            if err != 0 {
+                tracing::warn!("Everything_QueryW failed with error code: {}", err);
+            }
         }
     }
-    Vec::new()
+
+    QueryOutput::default()
 }
 ```
+
+### 5. 检索与展示核心规范
+
+1. **智能全路径匹配（Smart MatchPath）**：
+   - 当用户查询词中包含空格、反斜杠 `\` 或正斜杠 `/` 时（如 `ZenSearch main`、`workspace/src`），自动开启 `MatchPath(1)`，允许跨路径层级联合检索；
+   - 纯单个标识符搜索时使用 `MatchPath(0)`，专注于叶子文件名的高速精准召回。
+2. **查询状态彻底复位**：
+   - 每次 IPC 请求前重置大小写、全字匹配与正则标志位，杜绝被前序会话或外界全局设置污染。
+3. **权威时间降序排序（Recency-First Sorting）**：
+   - 采用 Everything 原生引擎支持的 `EVERYTHING_SORT_DATE_MODIFIED_DESCENDING (14)`（修改日期降序），使活跃工作集、最新保存文档与新建工程自动排在首位，完全契合启动器使用直觉。
+4. **配额与性能平衡**：
+   - 主搜索浮窗全局查询默认单次召回上限设定为 **100 条**；
+   - 结合 Slint `ListView` 自适应视口与键盘最小滚动跟随，兼顾海量候选覆盖与 60FPS 流畅滚动。
+
 
 ---
 
 ## 二、 Everything 随包内置与环境探针自愈闭环
 
-为实现安装即用的工业级体验，ZenSearch 将绿色版 `Everything.exe`（约 1.5MB）直接捆绑在安装包的 `tools/` 目录下。
+ZenSearch 将绿色版 `Everything.exe` 内置于 `tools/` 目录，构建环境自愈闭环：
 
 ```
 +─────────────────────────────────────────────────────────────────────────────+
@@ -107,24 +185,24 @@ pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
                                                ZenSearch 就绪
 ```
 
-### 1. 四级环境嗅探算法 (Rust 实现)
+### 1. 四级环境嗅探算法
 1. **Level 1 (运行态窗口嗅探)**：调用 `FindWindowW(w!("EVERYTHING_TASKBAR_NOTIFICATION"), None)`，若命中说明已在后台运行，直接复用（耗时 $\le 0.5\text{ms}$）；
 2. **Level 2 (注册表深度探测)**：使用 `windows::Win32::System::Registry` 查询 `HKLM` 与 `HKCU` 下的 `SOFTWARE\voidtools\Everything\InstallPath` 或 `App Paths\Everything.exe`；
-3. **Level 3 (环境变量 PATH 扫描)**：通过标准库 `std::env::var("PATH")` 扫描用户配置的绿色版；
+3. **Level 3 (环境变量 PATH 扫描)**：通过 `std::env::var("PATH")` 扫描用户配置的绿色版；
 4. **Level 4 (随包内置版终极兜底)**：探测当前程序目录下的 `tools/Everything.exe`。
 
 ### 2. 自动静默拉起与会话挂载
 若探测到有效路径且未在运行：
 * 调用 `std::process::Command::new(exe_path).arg("-startup").spawn()`；
-* 核心参数 `-startup` 确保其仅常驻托盘并在后台增量更新索引，**绝不弹出庞大的搜索主窗口**打扰用户；
-* 启动后以 100ms 间隔轮询 `FindWindowW`（最多 3 秒），完成丝滑对接。
+* 核心参数 `-startup` 确保其常驻系统托盘并后台增量更新索引，不主动弹出搜索主窗口；
+* 启动后以 100ms 间隔轮询 `FindWindowW`（最大 3 秒窗口），完成 IPC 通道对接。
 
 ---
 
 ## 三、 全局输入监听与低级键盘钩子 (WH_KEYBOARD_LL)
 
 ### 1. 零分配无锁钩子回调设计
-Windows 系统在用户按下按键时通过 `LowLevelHooksTimeout`（约 200~300ms）限制钩子处理时间。Rust 实现坚持**零堆分配、无阻塞、无锁**原则：
+Windows 操作系统通过 `LowLevelHooksTimeout` 严格限制钩子执行时延。键盘钩子回调遵循**零堆分配、无阻塞、无锁**原则：
 
 ```rust
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -156,7 +234,7 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
             // 双击 Ctrl 命中区间: 50ms ~ 350ms
             if diff > 50 && diff < 350 {
                 LAST_CTRL_PRESS_MS.store(0, Ordering::Relaxed);
-                // 向 UI 线程发送无阻塞唤醒信号 (如 crossbeam_channel)
+                // 向 UI 线程发送无阻塞唤醒信号
                 crate::EVENT_CHANNEL.0.try_send(crate::AppEvent::ToggleLauncher).ok();
                 // 消费该按键，防止向其他窗口继续传递
                 return LRESULT(1);
@@ -176,42 +254,28 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
 ## 四、 主搜索浮窗唤醒、失焦自隐与无状态规范 (Floating Overlay & Focus Pipeline)
 
 ### 1. 浮窗形态与任务栏隐形规范 (ToolWindow Floating Overlay)
-> [!IMPORTANT]
-> **形态定位：ZenSearch 主界面坚决不作为普通程序窗口打开，而是纯粹的轻量级桌面悬浮层（Floating Overlay）。**
-
-* **启动无感知**：双击运行或登录自启后直接转入后台常驻守护，**严禁主动弹窗打扰用户**；
+* **形态定位**：主界面为轻量级桌面悬浮层（Floating Overlay），启动后直接转入后台常驻守护，严禁主动弹窗打扰用户；
 * **任务栏与 Alt+Tab 隐形**：
-  * 通过 Win32 API 对原生窗口句柄应用扩展样式：
+  * 应用 Win32 扩展样式：
     $$\text{ExStyle} = (\text{ExStyle} \mid \text{WS\_EX\_TOOLWINDOW}) \ \& \ \sim\text{WS\_EX\_APPWINDOW}$$
-  * 效果：在 Windows 任务栏（Taskbar）中彻底无图标、在用户执行 `Alt + Tab` 应用切换时不占位，维持完全隐形；
+  * 在 Windows 任务栏无图标、`Alt + Tab` 应用切换时不占位；
 * **无边框卡片悬浮**：
   * Slint 声明 `no-frame: true`、`background: transparent`、`always-on-top: true`；
-  * 采用现代暗黑磨砂质感卡片与投影，浮于当前工作区视线焦点上方，零标题栏噪点。
+  * 暗黑磨砂质感卡片与投影，浮于当前工作区焦点上方。
 
 ---
 
-### 2. 失焦自动消失规范 (Auto-Dismiss on Unfocus / Lost Focus)
-> [!TIP]
-> **心流体验：即用即走，失焦即隐。**  
-> 用户在搜索浮窗唤醒后，若点击浮窗外部任意空白区、切换到其他软件或按下非本窗口操作，浮窗必须立刻无缝隐退，严禁残留遮挡用户视线。
-
-* **失焦判定链路**：
-  1. **Win32 窗口消息级监听**：监听宿主消息泵或子类化浮窗 HWND 的 `WM_ACTIVATE` 消息：
-     * 当 `LOWORD(wParam) == WA_INACTIVE` 时，判定浮窗失去系统焦点；
-     * 或捕获 `WM_KILLFOCUS` 消息判定按键焦点脱离；
-  2. **事件总线无阻塞分发**：触发 `AppEvent::DismissLauncher` 派发至 UI 事件循环；
-  3. **收起动作执行**：
-     * 立即执行 `ui.hide()`；
-     * 重置内部原子状态位 `is_launcher_visible.store(false)`；
-     * 触发无状态清空（Clean Slate），将输入文本与候选列表物理归零，焦点平滑归还给原底层前台窗口。
+### 2. 失焦自动消失规范 (Auto-Dismiss on Unfocus)
+* **判定链路**：
+  1. 监听浮窗 HWND 的 `WM_ACTIVATE`（`LOWORD(wParam) == WA_INACTIVE`）或 `WM_KILLFOCUS` 消息，判定焦点脱离；
+  2. 触发 `AppEvent::DismissLauncher` 派发至 UI 事件循环；
+  3. 执行收起：调用 `ui.hide()`，重置原子状态 `is_launcher_visible.store(false)`，并触发无状态清空（Clean Slate），将焦点平滑归还原活动窗口。
 
 ---
 
-### 3. 双击 Ctrl 穿透前台锁与搜索栏原子级强夺焦点 (Double-Ctrl Direct Focus)
+### 3. 双击 Ctrl 穿透前台锁与输入框原子聚焦 (Direct Focus Pipeline)
 > [!IMPORTANT]
-> **核心痛点攻坚**：Windows 操作系统具备严格的前台焦点限制保护（Foreground Lockout）。如果仅调用普通的 `ui.show()`，会导致浮窗虽绘制在屏幕顶层，但系统键盘焦点依然被先前的后台应用（如 Chrome、VS Code、Terminal）牢牢锁定，造成“输入框没有光标闪烁、击键依然打进原来程序”的严重缺陷。
-
-ZenSearch 落地**前台锁穿透与输入框原子聚焦 6 步流水线**，确保用户按下双击 Ctrl 的瞬间，键盘焦点 100% 稳固锁定在搜索输入框上：
+> **前台锁穿透（Foreground Lockout Bypass）**：Windows 操作系统具备严格的前台焦点限制保护。ZenSearch 采用跨进程输入挂载与激活管道，确保浮窗呼出瞬间系统键盘焦点 100% 直达搜索输入框，杜绝丢字与光标失焦。
 
 ```
 +─────────────────────────────────────────────────────────────────────────────+
@@ -250,16 +314,15 @@ ZenSearch 落地**前台锁穿透与输入框原子聚焦 6 步流水线**，确
                   ui.invoke_focus_input() -> search_input.focus()
 ```
 
-* **敲击零延迟**：经过此管道处理，唤醒后用户敲击的第一个字符 **100% 直达搜索栏**，输入框立即呈现活动光标，零丢字、零丢键，无需鼠标二次辅助。
-
 ---
 
 ### 4. 唤醒无状态即时清空规范 (Stateless Clean Slate)
-桌面启动器的核心价值在于“即用即走、意图独立”。保留上一次的搜索记录会导致严重的视觉噪点并极易因敲击 Enter 导致误启动历史文件。
-* **准则 1：输入框物理归零**：每次呼出必须 100% 清空输入框；
-* **准则 2：候选模型与滚动偏移彻底归零**：候选列表归零，`selected_index` 置 `0`，`scroll_y` 置 `0px`（列表视口回到顶部），折叠回紧凑的单行搜索条（Base Height）；
-* **准则 3：未决任务熔断**：前序输入未完成的 Everything 异步检索 Token 立即取消，杜绝迟到回调覆盖当前状态；
-* **准则 4：原子级前台夺取**：光标稳固聚焦在空输入框首位。
+* **输入框物理归零**：每次呼出清空输入框文本；
+* **候选模型与滚动偏移归零**：候选列表清空，`selected_index` 置 `0`，`scroll_y` 置 `0px`（列表视口回到顶部），折叠回紧凑单行搜索条（Base Height）；
+* **未决任务熔断**：前序未完成的 Everything 异步检索 Token 立即取消，杜绝迟到回调覆盖当前状态；
+* **原子级前台夺取**：光标稳固聚焦在空输入框首位。
+
+---
 
 ### 5. 唤醒无状态重置 8 步管道时序
 
@@ -309,6 +372,8 @@ ZenSearch 落地**前台锁穿透与输入框原子聚焦 6 步流水线**，确
                                             SetFocus + ui.invoke_focus_input()
 ```
 
+---
+
 ### 6. Slint 声明式 UI 设计范式 (`ui/launcher.slint`)
 
 ```slint
@@ -318,6 +383,7 @@ import { Theme } from "common.slint";
 export struct SearchItem {
     filename: string,
     path: string,
+    icon: image,
 }
 
 export component LauncherWindow inherits Window {
@@ -398,6 +464,18 @@ export component LauncherWindow inherits Window {
                     for item[idx] in root.result_items : Rectangle {
                         height: 50px;
                         // 候选条目渲染与鼠标/键盘选择
+                        item_touch := TouchArea {
+                            clicked => {
+                                root.selected_index = idx;
+                                root.item_activated(idx);
+                            }
+                            pointer-event(event) => {
+                                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                    root.selected_index = idx;
+                                    root.item_open_folder(idx);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -406,88 +484,85 @@ export component LauncherWindow inherits Window {
 }
 ```
 
-### 7. 键盘高频交互规范与候选列表视口自动滚动跟随 (Scroll-Follow-Selection)
+---
 
-#### (1) 核心快捷键映射
-* `UpArrow` / `DownArrow`：切换候选高亮条目，**首末项边界驻留（不循环回绕）**，并实时驱动列表视口滚动跟随；
-* `Enter`：执行打开当前高亮文件或文件夹；
-* `Ctrl + O`：调用 `std::process::Command::new("explorer").arg(format!("/select,\"{}\"", path)).spawn()` 在资源管理器中定位并选中目标文件；
-* `Esc`：**仅关闭并隐藏搜索浮窗**（Dismiss / Hide），绝不退出后台常驻进程；
-* **任意失焦**：鼠标点击浮窗外或切换窗口，自动隐退消失。
+### 7. 键鼠高频交互与候选列表视口滚动跟随 (Interactive Navigation & Direct Locating)
 
-#### (2) 为什么需要显式视口滚动跟随机制？
-在 Slint GUI 框架中：
-1. **焦点与滚动解耦**：键盘焦点始终保持在顶部的 `search_input`（`LineEdit`）上以支持随时继续打字，按上下方向键仅修改 `root.selected_index` 属性，Slint 的 `ListView` 不会感知自定义索引属性的变化，因此默认不会自动滚动；
-2. **条件块作用域隔离**：`ListView` 位于 `if root.is_expanded : VerticalLayout` 条件渲染块内，Slint 编译器禁止在组件顶层函数或外部平级控件（`LineEdit`）中直接通过元素 ID 访问条件块内的子组件属性。
+#### (1) 核心输入交互与操作映射 (Keyboard & Mouse Mapping)
+ZenSearch 采用键鼠对称的一致性操作模型，兼顾全键盘效率流与鼠标指针直觉流：
+* **导航与切换**：`UpArrow` / `DownArrow` 切换候选高亮条目，首末项边界驻留（不循环回绕），实时驱动列表视口滚动跟随；
+* **打开/执行目标**：按 `Enter` 键或**鼠标左键单击**条目，直接打开当前高亮文件或运行目标程序（`item_activated`）；
+* **定位目标所在文件夹**：按 `Ctrl + O` 或**鼠标悬停在条目上单击右键**，直接在全新独立资源管理器窗口中定位并高亮选中该目标（`item_open_folder`），无需多级右键菜单层级，实现即点即达的瞬时穿透；
+* **关闭浮窗**：按 `Esc` 键仅隐藏搜索浮窗（Dismiss / Hide），保持后台守护进程常驻；
+* **任意失焦**：鼠标点击浮窗外部或系统前台窗口切换，自动隐退。
 
-#### (3) `content-y <=> scroll_y` 双向绑定与最小滚动推导算法
-为突破条件作用域限制并同时兼容**鼠标滚轮滚动**与**键盘方向键导航**：
-* **双向数据绑定**：在 `LauncherWindow` 顶层声明 `in-out property <length> scroll_y: 0px;`，并在 `ListView` 上建立双向绑定 `content-y <=> root.scroll_y;`（注：Slint 1.8+ 中使用标准属性 `content-y` 替代已弃用的 `viewport-y`，坐标约定为 $\text{scroll\_y} \le 0\text{px}$，列表向下滚动时 `scroll_y` 减小为负值）。用户拨动鼠标滚轮时 `ListView` 自动回写 `root.scroll_y`；按下方向键时 `ensure_selected_visible()` 更新 `root.scroll_y` 驱动 `ListView` 同步滚动。
-* **最小滚动调整公式 (Minimal Viewport Scrolling)**：
-  * 可视区高度：$H_{view} = \min(400\text{px}, N \times 52\text{px})$（单屏最多完整展示 8 项：$8 \times 50\text{px} = 400\text{px}$）；
-  * 当前选中项上下边界：$Y_{top} = \text{selected\_index} \times 50\text{px}$，$Y_{bottom} = Y_{top} + 50\text{px}$；
-  * 当前视口可见区间：$[-\text{scroll\_y},\ -\text{scroll\_y} + H_{view}]$；
-  * **向上越界对齐顶部**：若 $Y_{top} < -\text{scroll\_y}$，则令 $\text{scroll\_y} = -Y_{top}$；
-  * **向下越界对齐底部**：若 $Y_{bottom} > -\text{scroll\_y} + H_{view}$，则令 $\text{scroll\_y} = H_{view} - Y_{bottom}$；
-  * **处于可视区内**：保持 `scroll_y` 不变，避免列表发生无意义的跳动。
-* **状态重置同步**：当用户在输入框修改搜索词触发 `edited(text)` 或浮窗关闭/唤醒触发 `reset_state()` 时，同步将 `selected_index = 0` 且 `scroll_y = 0px`，确保新搜索结果始终从顶部第一项开始展示。
+#### (2) 视口滚动跟随与双向绑定设计
+* **焦点与滚动解耦**：键盘焦点始终保持在顶层 `search_input`，方向键通过修改 `root.selected_index` 并调用 `ensure_selected_visible()` 驱动列表视口同步滚动；
+* **双向属性绑定**：在 `LauncherWindow` 顶层声明 `in-out property <length> scroll_y: 0px;`，与内部 `ListView` 的 `content-y` 属性双向绑定（$\text{scroll\_y} \le 0\text{px}$）。用户拨动滚轮时自动回写 `root.scroll_y`，方向键导航时修改 `root.scroll_y` 驱动列表滚动。
+
+#### (3) 最小视口滚动推导算法 (Minimal Viewport Scrolling)
+* **可视区高度**：$H_{view} = \min(400\text{px}, N \times 52\text{px})$（单屏最多完整展示 8 项：$8 \times 50\text{px} = 400\text{px}$）；
+* **当前选中项上下边界**：$Y_{top} = \text{selected\_index} \times 50\text{px}$，$Y_{bottom} = Y_{top} + 50\text{px}$；
+* **向上越界对齐顶部**：若 $Y_{top} < -\text{scroll\_y}$，则令 $\text{scroll\_y} = -Y_{top}$；
+* **向下越界对齐底部**：若 $Y_{bottom} > -\text{scroll\_y} + H_{view}$，则令 $\text{scroll\_y} = H_{view} - Y_{bottom}$；
+* **可视区内保持不变**：当前选中项完全可见时保持 `scroll_y` 不变，避免界面跳动；
+* **重置同步**：输入框文本变动（`edited(text)`）或浮窗复位（`reset_state()`）时，同步重置 `selected_index = 0` 与 `scroll_y = 0px`。
+
+#### (4) 独立资源管理器窗口定位与命令行转义防护 (Independent Explorer Window)
+在候选条目上按下 `Ctrl + O` 或鼠标右键单击触发目录定位时，遵循以下规范：
+* **窗口独立性 (No Reuse)**：启动参数使用 `/n, /select,"<Path>"` 强制新建独立 Explorer 窗口，绝不复用现有窗口或多标签页；
+* **文件与文件夹对称性**：选中文件在其父目录高亮，选中文件夹在其父目录高亮（而非直接进入目录内部）；
+* **命令行原始传参 (raw_arg)**：使用 `std::os::windows::process::CommandExt::raw_arg()` 绕过 Rust 标准库 CRT 引号转义（转义为 `\"` 会导致 Explorer 解析失败而回退打开“桌面”）；
+* **路径规范化清洗**：执行 `replace('/', "\\").trim_end_matches('\\')` 清洗尾部反斜杠，杜绝语法截断；
+* **驱动器根目录保护**：对于 `C:\`、`D:` 等驱动器根路径，直接使用 `/n,"D:\"` 开新窗口，跳过 `/select`。
 
 ---
 
-## 五、 后台常驻守护与窗口生命周期解耦规范 (Daemon Lifecycle & Esc Dismissal)
+## 五、 后台常驻守护与窗口生命周期解耦 (Daemon Lifecycle & Esc Dismissal)
 
 ### 1. 守护常驻原则 (Resident Daemon Principle)
-ZenSearch 本质是一款 Windows 系统级全局快捷启动器与生产力随行伴侣，必须彻底与“单窗口普通桌面软件”的生命周期解耦：
-* **后台静默常驻**：程序启动后（无论是开机自启 `--silent` 还是用户手动拉起），主进程即刻转入系统后台守护态，常驻于 Windows 系统托盘（`Shell_NotifyIconW`）；
-* **全局持续侦听**：后台无中断运行 `WH_KEYBOARD_LL` 低级键盘钩子（双击 Ctrl 快速呼出）、`SetWinEventHook` 焦点转移（资源管理器与对话框注入）以及 `ZenSearch_MessageHost` 隐藏消息窗口；
-* **极速瞬时响应**：UI 窗口资源在初始化时常驻内存（常驻内存仅约 10MB），唤醒时仅做属性重置与贴边定位，启动耗时 $\le 10\text{ms}$，绝不重新冷启动。
+* **后台静默常驻**：程序启动后（支持 `--silent` 开机自启），主进程转入后台系统托盘守护态（`Shell_NotifyIconW`）；
+* **全局持续侦听**：常驻运行 `WH_KEYBOARD_LL` 低级键盘钩子、`SetWinEventHook` 焦点转移监控及 `ZenSearch_MessageHost` 隐藏消息窗口；
+* **极速瞬时唤醒**：UI 窗口资源常驻内存（约 10MB），唤醒时仅执行属性重置与屏幕居中定位，响应时延 $\le 10\text{ms}$。
 
-### 2. Esc 键行为隔离准则 (Esc Dismissal Guard)
+### 2. Esc 键行为隔离与事件循环保活 (Esc Dismissal Guard)
 > [!IMPORTANT]
-> **红线规则：按 Esc 键严禁退出程序进程！**  
-> 在用户的心流模型中，按下 `Esc` 仅仅是“放弃本次搜索或收起浮窗”，视觉焦点归还给先前的活动工作区。若按 `Esc` 导致进程直接终结，将直接导致托盘消失、双击 Ctrl 快捷键全面瘫痪。
+> **Esc 行为隔离**：按下 Esc 键仅执行 `ui.hide()` 收起并重置搜索浮窗，严禁终止主进程。
 
-* **UI 回调解耦**：当捕捉到 `Esc` 击键事件时，仅执行 `ui.hide()` 与可见性标志位复位；
-* **事件循环长保活**：Slint 框架默认的 `run_event_loop()` 会在最后一个窗口隐藏（Hide）时判定应用无可见窗体并自动终止事件循环。ZenSearch 必须强制改用 **`slint::run_event_loop_until_quit()`**，切断“无可见窗口”与“退出事件循环”之间的默认级联关系；
-* **退出机制严格收口**：全局仅允许以下两条合法退出路径：
-  1. 用户主动右键系统托盘图标，明确点击 **“退出 ZenSearch”** 菜单项；
-  2. 外部安装器、升级包或系统注销时发送的显式终止指令（如 `taskkill /F /IM zensearch.exe`）。
+* **UI 回调解耦**：捕获 Esc 击键事件时仅执行隐藏与无状态复位；
+* **事件循环保活**：强制采用 `slint::run_event_loop_until_quit()` 替代默认的 `run_event_loop()`，切断“无可见窗口”与“退出事件循环”之间的级联关联，确保浮窗隐藏后后台钩子与托盘持续保活；
+* **退出机制严格收口**：全局仅允许系统托盘右键菜单“退出 ZenSearch”或显式终止指令（如升级安装器）终止进程。
 
 ### 3. Windows 子系统与无控制台黑框规范 (`windows_subsystem`)
-* 采用 `#![windows_subsystem = "windows"]` 链接目标，在用户双击运行或登录自启时，**坚决不弹出任何黑色的 cmd 终端控制台窗口**；
-* 针对 `--diagnose`（健康体检）与 `--diagnose-watch`（击键监控）等 CLI 诊断场景，在程序启动阶段通过 Win32 API `AttachConsole(ATTACH_PARENT_PROCESS)` 动态挂载父终端控制台，实现“作为后台常驻时零弹框，作为诊断命令时标准输出”的无缝融合。
+* 声明 `#![windows_subsystem = "windows"]`，开机自启与常规运行时无任何终端黑框；
+* 针对 `--diagnose`（健康体检）与 `--diagnose-watch`（击键监控）等 CLI 诊断场景，在启动初期通过 `AttachConsole(ATTACH_PARENT_PROCESS)` 动态挂载父终端控制台输出信息。
 
 ---
 
 ## 六、 候选列表原生多类型图标适配与零 I/O 缓存规范 (Native Shell Icons & Zero-I/O Caching)
 
-### 1. 需求背景与视觉体验目标
-在早期版本中，搜索结果列表中的每个候选条目均硬编码为通用的文档符号（Emoji `📄`），缺乏对内容类型的直观辨识度。
-为对齐 Windows 资源管理器、Everything 官方客户端与主流快捷启动工具的视觉体验，系统实现原生图标适配标准：
+### 1. 视觉体验目标与系统图标映射
+ZenSearch 候选列表与 Windows 原生 Shell 图标体系完全对齐：
 * **文件夹（Directory）**：呈现系统标准黄色文件夹图标；
-* **各类关联文档**：如 `.txt` 显示用户当前关联程序（记事本/Notepad++/VSCode）的高清图标，`.pdf`、`.docx`、`.zip` 等各类文档精确展示对应软件专属图标；
-* **可执行程序（.exe/.lnk）**：精准提取并呈现其软件内嵌的专属 LOGO 图标（如 Chrome、微信等自身图标）；
-* **完整透明通道与高分屏适配**：保留 32 位 Alpha 通道与抗锯齿，在高 DPI 环境下清晰锐利。
+* **各类关联文档**：`.txt`、`.pdf`、`.docx`、`.zip` 等精准展示用户当前系统关联软件专属图标；
+* **可执行程序（.exe/.lnk）**：精准提取呈现内嵌专属 LOGO 图标；
+* **高分屏与透明通道**：保留 32 位 Alpha 通道与抗锯齿，高 DPI 环境下清晰锐利。
 
-### 2. 性能红线：为什么拒绝“朴素读取物理文件”？
-Everything 检索性能极高（通常在 1~5ms 内返回结果）。若每次搜出 20 项结果均直接通过磁盘物理路径提取图标：
-* **机械硬盘/网络共享盘（NAS）灾难**：读取休眠外置盘或网络路径将触发数十至数百毫秒的阻塞，导致用户打字输入严重掉帧假死；
-* **高频 GDI 句柄泄漏与 GC 压力**：连续击键频繁分配销毁 GDI DC 与位图会造成 CPU 抖动。
-
-因此，图标适配的核心准则是：**“绝对零磁盘 I/O + 扩展名全生命周期单例复用”**。
+### 2. 零磁盘 I/O 设计准则 (Zero-I/O Caching)
+由于 Everything 毫秒级检索对高频击键高度敏感，若直接读取物理磁盘提取图标，在网络共享盘（NAS）或休眠外置盘场景下会引发阻塞假死。系统遵循以下准则：
+* **绝对零磁盘 I/O**：常规后缀及文件夹基于虚拟属性查询，完全不碰硬盘；
+* **全生命周期单例复用**：常规文件类型图标在内存中全局只提取并缓存一份；
+* **GDI 资源严格管理**：位图转换后立即释放 GDI DC 与图标句柄，杜绝句柄泄漏。
 
 ### 3. Win32 原生提取流水线 (`src/core/icon_provider.rs`)
-通过微软官方 `windows` crate 直接对接 Win32 Shell 与 GDI API：
-
 1. **虚拟属性提取 (Virtual Query)**：
-   * 对常规扩展名（如 `.txt`, `.docx`, `.pdf`, `.zip` 等）及文件夹，调用 Win32 `SHGetFileInfoW` 时传入 `SHGFI_USEFILEATTRIBUTES | SHGFI_ICON | SHGFI_SMALLICON` 标志；
-   * 路径直接传入虚拟名称（如 `folder`、`file.txt`），属性传入 `FILE_ATTRIBUTE_DIRECTORY` 或 `FILE_ATTRIBUTE_NORMAL`；
-   * **零 I/O 优势**：Windows 直接从系统注册表与 Shell 内存缓存解析对应图标，**完全不碰硬盘**，单次提取耗时在微秒级。
+   * 调用 `SHGetFileInfoW` 时传入 `SHGFI_USEFILEATTRIBUTES | SHGFI_ICON | SHGFI_SMALLICON` 标志；
+   * 路径传入虚拟名称（如 `folder`、`file.txt`），属性传入 `FILE_ATTRIBUTE_DIRECTORY` 或 `FILE_ATTRIBUTE_NORMAL`，直接从系统注册表与 Shell 内存缓存解析图标；
 2. **HICON 到 32 位 RGBA 像素转换**：
-   * 通过 `GetIconInfo` 获取彩色位图句柄 `hbmColor`；
+   * 通过 `GetIconInfo` 获取 `hbmColor`；
    * 使用 `CreateCompatibleDC` 与 `GetDIBits`，指定 `biHeight = -height`（Top-down DIB 自顶向下排布）解压出标准 32-bit BGRA 像素序列；
-   * 自动探测与修复透明通道：针对具备 Alpha 通道的现代图标直接交换 R/B 分量转为 RGBA，针对老旧 24-bit 无 Alpha 位图自动将有效颜色像素标记为完全不透明（$\alpha = 255$）；
-   * 严格调用 `DeleteObject`、`DeleteDC` 和 `DestroyIcon`，杜绝任何 GDI 句柄泄漏。
+   * 现代 32 位图标交换 R/B 分量转为 RGBA，老旧 24 位位图自动填充完全不透明 Alpha（$\alpha = 255$）；
+   * 调用 `DeleteObject`、`DeleteDC` 和 `DestroyIcon` 清理句柄。
 
 ```rust
 // 核心数据模型：线程安全与零拷贝设计
@@ -509,34 +584,32 @@ impl CachedIcon {
 ```
 
 ### 4. 两级内存常驻单例缓存与开机预热机制
-为保障并发安全与极致性能，系统采用两级缓存架构：
 * **一级：扩展名全局常驻缓存 (`EXT_CACHE: LazyLock<RwLock<HashMap<String, CachedIcon>>>`)**：
-  * 常规后缀与文件夹在内存中全生命周期仅提取并保存一份；
-  * 打字搜索连续命中相同类型时，仅耗时 **10~50 纳秒**，耗时可忽略不计；
+  * 常规后缀与文件夹在内存中全生命周期仅提取一份，命中耗时仅 10~50 纳秒；
 * **二级：实体可执行程序 LRU 缓存 (`EXE_CACHE: LazyLock<RwLock<HashMap<PathBuf, CachedIcon>>>`)**：
-  * 仅针对 `.exe`、`.lnk` 等按文件拥有独立内嵌图标的程序，按绝对路径哈希并限制上限 200 项，防止内存无序增长与磁盘重复访问；
+  * 针对 `.exe`、`.lnk` 等具备独立内嵌图标的程序，按绝对路径哈希并限制上限 200 项，防止内存无序增长；
 * **开机静默预热 (`icon_provider::init()`)**：
-  * 随 ZenSearch 主进程启动，在后台静默预热常见的 30 种核心类型（文件夹、txt、docx、pdf、zip、png、exe默认等），确保用户第一次敲击键盘即可享受 100% 内存即时命中。
+  * 随主进程启动在后台预热常见核心类型（文件夹、txt、docx、pdf、zip、png、exe 等），保障首次敲击即 100% 内存命中。
 
-### 5. Slint 声明式组件改造 (`ui/launcher.slint`)
-* 在 `SearchItem` 结构体中新增 `icon: image` 属性；
-* 列表项布局将原写死文本替换为高保真自适应组件：
-  ```slint
-  Rectangle {
-      width: 28px;
-      height: 28px;
-      y: 5px;
-      border-radius: 6px;
-      background: idx == root.selected_index ? #3E4256 : #2D303E;
+### 5. Slint 声明式组件设计 (`ui/launcher.slint`)
+* `SearchItem` 声明 `icon: image`；
+* 候选列表条目采用自适应图标容器：
 
-      Image {
-          source: item.icon;
-          width: 18px;
-          height: 18px;
-          image-fit: contain;
-          horizontal-alignment: center;
-          vertical-alignment: center;
-      }
-  }
-  ```
+```slint
+Rectangle {
+    width: 28px;
+    height: 28px;
+    y: 5px;
+    border-radius: 6px;
+    background: idx == root.selected_index ? #3E4256 : #2D303E;
 
+    Image {
+        source: item.icon;
+        width: 18px;
+        height: 18px;
+        image-fit: contain;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+```

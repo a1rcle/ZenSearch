@@ -19,16 +19,39 @@ extern "system" {
     fn Everything_SetRequestFlags(dwRequestFlags: u32);
     fn Everything_SetMax(dwMax: u32);
     fn Everything_SetSort(dwSortType: u32);
+    fn Everything_SetMatchPath(bEnable: i32);
+    fn Everything_SetMatchCase(bEnable: i32);
+    fn Everything_SetMatchWholeWord(bEnable: i32);
+    fn Everything_SetRegex(bEnable: i32);
     fn Everything_QueryW(bWait: i32) -> i32;
     fn Everything_GetNumResults() -> u32;
+    fn Everything_GetTotResults() -> u32;
     fn Everything_GetResultFullPathNameW(nIndex: u32, lpString: *mut u16, nMaxCount: u32) -> u32;
     fn Everything_GetLastError() -> u32;
 }
+
+pub const EVERYTHING_SORT_NAME_ASCENDING: u32 = 1;
+pub const EVERYTHING_SORT_PATH_ASCENDING: u32 = 3;
+pub const EVERYTHING_SORT_DATE_MODIFIED_DESCENDING: u32 = 14;
+pub const EVERYTHING_SORT_RUN_COUNT_DESCENDING: u32 = 20;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: String,
     pub filename: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryOutput {
+    pub results: Vec<SearchResult>,
+    pub total_matched: u32,
+}
+
+impl std::ops::Deref for QueryOutput {
+    type Target = [SearchResult];
+    fn deref(&self) -> &Self::Target {
+        &self.results
+    }
 }
 
 pub fn is_everything_running() -> bool {
@@ -145,24 +168,38 @@ pub fn ensure_everything_service() -> bool {
     false
 }
 
-pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
-    if query.trim().is_empty() {
-        return Vec::new();
+pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryOutput::default();
     }
 
-    let wide_query: Vec<u16> = OsStr::new(query)
+    let wide_query: Vec<u16> = OsStr::new(trimmed)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
 
+    let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
+        1
+    } else {
+        0
+    };
+
     unsafe {
+        // Reset query flags to prevent state pollution
+        Everything_SetMatchCase(0);
+        Everything_SetMatchWholeWord(0);
+        Everything_SetRegex(0);
+        Everything_SetMatchPath(enable_match_path);
+
         Everything_SetSearchW(wide_query.as_ptr());
         Everything_SetRequestFlags(0x00000001 | 0x00000002); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Everything_SetMax(max_results);
-        Everything_SetSort(13); // EVERYTHING_SORT_RUN_COUNT_DESCENDING
+        Everything_SetSort(EVERYTHING_SORT_DATE_MODIFIED_DESCENDING); // 14: Date Modified Descending
 
         if Everything_QueryW(1) != 0 {
             let count = Everything_GetNumResults();
+            let total_matched = Everything_GetTotResults();
             let mut results = Vec::with_capacity(count as usize);
             let mut buffer = [0u16; 1024];
 
@@ -177,7 +214,7 @@ pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
                     results.push(SearchResult { path, filename });
                 }
             }
-            return results;
+            return QueryOutput { results, total_matched };
         } else {
             let err = Everything_GetLastError();
             if err != 0 {
@@ -186,5 +223,5 @@ pub fn execute_query(query: &str, max_results: u32) -> Vec<SearchResult> {
         }
     }
 
-    Vec::new()
+    QueryOutput::default()
 }

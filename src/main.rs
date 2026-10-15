@@ -91,7 +91,7 @@ fn main() {
                     let metrics = core::scale_manager::calculate_launcher_geometry(false, 0);
                     ui.window().set_size(slint::PhysicalSize::new(metrics.width as u32, metrics.height as u32));
                 } else {
-                    let results = core::everything::execute_query(&trimmed, 20);
+                    let results = core::everything::execute_query(&trimmed, 100);
                     let slint_items: Vec<SearchItem> = results
                         .iter()
                         .map(|r| SearchItem {
@@ -145,9 +145,7 @@ fn main() {
                 let items = ui.get_result_items();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
-                    let _ = std::process::Command::new("explorer")
-                        .arg(format!("/select,\"{}\"", path))
-                        .spawn();
+                    core::explorer::open_in_new_explorer_and_select(&path);
                 }
                 ui.hide().ok();
                 visible_flag.store(false, Ordering::SeqCst);
@@ -248,9 +246,7 @@ fn main() {
                 let items = ui.get_result_items();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
-                    let _ = std::process::Command::new("explorer")
-                        .arg(format!("/select,{}", path))
-                        .spawn();
+                    core::explorer::open_in_new_explorer_and_select(&path);
                 }
                 ui.hide().ok();
                 visible_flag.store(false, Ordering::SeqCst);
@@ -448,7 +444,7 @@ fn run_diagnose() {
         println!("  - 可执行文件路径: 未检索到有效路径");
     }
     let test_results = core::everything::execute_query("Windows", 5);
-    println!("  - IPC 查询吞吐测试: 成功召回 {} 条候选", test_results.len());
+    println!("  - IPC 查询吞吐测试: 成功召回 {} 条候选 (库内总匹配数: {})", test_results.len(), test_results.total_matched);
     for (i, r) in test_results.iter().enumerate().take(3) {
         println!("    [{}] {} ({})", i + 1, r.filename, r.path);
     }

@@ -91,7 +91,7 @@ export component LauncherWindow inherits Window {
                 // Input Box
                 search_input := LineEdit {
                     text <=> root.search_text;
-                    placeholder-text: "ZenSearch 极速搜索 (Enter 打开, Ctrl+O 定位, Esc 退出)...";
+                    placeholder-text: "ZenSearch 极速搜索 (左键/Enter 打开, 右键/Ctrl+O 定位, Esc 退出)...";
                     font-size: 15px;
                     horizontal-stretch: 1;
 
@@ -153,6 +153,12 @@ export component LauncherWindow inherits Window {
                             clicked => {
                                 root.selected_index = idx;
                                 root.item_activated(idx);
+                            }
+                            pointer-event(event) => {
+                                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                    root.selected_index = idx;
+                                    root.item_open_folder(idx);
+                                }
                             }
                         }
 

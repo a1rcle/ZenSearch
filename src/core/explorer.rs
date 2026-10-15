@@ -129,3 +129,73 @@ fn is_parent_or_equal(parent: HWND, child: HWND) -> bool {
     }
     false
 }
+
+/// Normalizes path and builds the explorer command line argument to open in a new window with selection.
+pub fn build_explorer_select_args(path: &str) -> Option<String> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // 1. Normalize path: convert forward slashes to backslashes
+    let normalized = raw.replace('/', "\\");
+
+    // 2. Drive root boundary check: C: or C:\ has no parent to select from, open root directly in new window
+    let trimmed = normalized.trim_end_matches('\\');
+    if trimmed.len() <= 2 && trimmed.ends_with(':') {
+        return Some(format!("/n,\"{}:\\\"", &trimmed[0..1]));
+    }
+
+    // 3. For all other files and directories: trim trailing slashes to avoid escaping closing quote
+    let clean_path = trimmed;
+    Some(format!("/n, /select,\"{}\"", clean_path))
+}
+
+/// Opens a new Explorer window locating and selecting the target item (file or folder).
+/// Forces a new independent window (/n) and never reuses existing windows/tabs.
+pub fn open_in_new_explorer_and_select(path: &str) {
+    if let Some(raw_args) = build_explorer_select_args(path) {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(raw_args)
+            .spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_explorer_select_args_file() {
+        let args = build_explorer_select_args(r"D:\ZenSearch\Cargo.toml").unwrap();
+        assert_eq!(args, r#"/n, /select,"D:\ZenSearch\Cargo.toml""#);
+    }
+
+    #[test]
+    fn test_build_explorer_select_args_dir() {
+        // Directory with trailing slash should have it trimmed
+        let args = build_explorer_select_args(r"D:\ZenSearch\src\").unwrap();
+        assert_eq!(args, r#"/n, /select,"D:\ZenSearch\src""#);
+    }
+
+    #[test]
+    fn test_build_explorer_select_args_forward_slashes() {
+        let args = build_explorer_select_args("D:/ZenSearch/src/").unwrap();
+        assert_eq!(args, r#"/n, /select,"D:\ZenSearch\src""#);
+    }
+
+    #[test]
+    fn test_build_explorer_select_args_drive_root() {
+        let args1 = build_explorer_select_args(r"C:\").unwrap();
+        assert_eq!(args1, r#"/n,"C:\""#);
+
+        let args2 = build_explorer_select_args("D:").unwrap();
+        assert_eq!(args2, r#"/n,"D:\""#);
+    }
+
+    #[test]
+    fn test_build_explorer_select_args_empty() {
+        assert!(build_explorer_select_args("   ").is_none());
+    }
+}
