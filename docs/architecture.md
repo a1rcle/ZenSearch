@@ -43,12 +43,15 @@ ZenSearch 是一款面向 Windows 平台的高性能桌面启动与搜索增强�
 |       ├── 双击 Ctrl 状态机 (Atomic 时间戳与防误触重置)                                |
 |       └── 跨线程无阻塞分发通道 (crossbeam-channel / std::sync::mpsc)                   |
 +---------------------------------------------------------------------------------------+
-|  [ 2. 搜索服务中台 (Search Engine) ]                                                  |
+|  [ 2. 搜索服务与排序引擎中台 (Search & Ranking Engine) ]                             |
 |       ├── Everything-SDK 原生 FFI 绑定与状态机复位管道                                 |
-|       ├── 智能全路径匹配 (Smart MatchPath) 与修改日期降序引擎                         |
+|       ├── 宽进精排架构 (Everything 粗排 100~300 条候选 + Rust 纳秒级精排)              |
+|       ├── 综合多维打分引擎 (全字/前缀/子串/缩写/深度惩罚/脏目录抑制)                   |
+|       ├── 自适应使用学习与 Query 记忆绑定 (半衰期指数时间衰减模型)                      |
+|       ├── 场景上下文感知 (Launcher 可执行文件优先 / Companion 目录优先)                |
 |       ├── 随包捆绑 Everything 进程守护与静默拉起器 (-startup)                         |
 |       ├── Win32 Shell 原生图标提取与零 I/O 虚拟属性两级常驻缓存 (icon_provider)        |
-|       └── Scoped Search 语法装配器与 100 条高容积流式分发管道                        |
+|       └── Scoped Search 语法装配器与流式分发管道                                       |
 +---------------------------------------------------------------------------------------+
 |  [ 3. 主搜索浮窗与无状态唤醒中枢 (Slint Global Launcher) ]                             |
 |       ├── 纯浮窗形态与任务栏隐形 (WS_EX_TOOLWINDOW 剥离 WS_EX_APPWINDOW)              |
@@ -112,6 +115,10 @@ ZenSearch/
 │   │   ├── hotkey.rs             # WH_KEYBOARD_LL 键盘钩子与双击状态机
 │   │   ├── icon_provider.rs      # Win32 Shell 原生图标提取与零 I/O 双级缓存
 │   │   ├── injector.rs           # #32770 对话框路径注入与回环校验
+│   │   ├── ranking/              # Listary 式综合评分排序与历史自适应引擎
+│   │   │   ├── mod.rs            # 模块对外统一接口导出
+│   │   │   ├── scorer.rs         # 多维复合打分算法 (匹配度/上下文/深度惩罚)
+│   │   │   └── history.rs        # 启动历史、使用频次、半衰期衰减与 Query 绑定存储
 │   │   ├── scale_manager.rs      # DPI 感知与动态尺寸推导
 │   │   ├── single_instance.rs    # Win32 命名互斥体与已有实例激活
 │   │   └── window_helper.rs      # 窗口句柄查找、Z-Order 提升与前台聚焦辅助
@@ -123,6 +130,8 @@ ZenSearch/
 │       └── paths.rs              # 标准目录解析 (%APPDATA%, %LOCALAPPDATA%)
 ├── tests/                        # 集成与自动化测试套件
 │   ├── test_path_injection.rs    # 对话框路径注入模拟集成测试
+│   ├── test_ranking_algorithm.rs # 综合排序算法与自适应学习单元测试
+│   ├── test_search_query.rs      # Everything 语义与 Deref 规范测试
 │   └── test_ui_scale.rs          # 高 DPI 与窗口缩放推导单元测试
 ├── installer/                    # 安装包工程
 │   ├── zensearch.iss             # Inno Setup 编译脚本
@@ -148,10 +157,13 @@ ZenSearch 严格遵循 Windows 平台的特权模型与目录写入规范，保�
 * **日志与临时缓存目录 (`%LOCALAPPDATA%\ZenSearch\logs`)**：
   * 存放循环滚动日志 `zensearch.log`。
 
-### 2. UIPI 特权穿透与任务计划程序免 UAC 自启
-* **运行机制**：
-  * Inno Setup 安装包在管理员安装模式下，通过 Windows **任务计划程序 (Task Scheduler)** 注册自启动任务；
-  * 设定属性：`RunLevel: HighestAvailable`，在用户登录时以当前用户最高可用权限静默启动 `zensearch.exe --silent`；
+### 2. UIPI 特权穿透与双通道自启体系 (Dual-Channel Autostart & UIPI Bypass)
+* **运行机制与双通道协同**：
+  * **计划任务特权自启通道**：Inno Setup 安装包在管理员安装模式下，通过 Windows **任务计划程序 (Task Scheduler)** 注册自启动任务，设定属性 `RunLevel: HighestAvailable`，在用户登录时以当前用户最高可用权限静默启动 `zensearch.exe --silent`；
+  * **注册表常规自启通道**：普通安装或用户在托盘菜单直接切换自启时，配置 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`；
+* **极速无感探测与控制台隔离**：
+  * 状态检测遵循“纯注册表首检短路 + 计划任务状态 60s TTL 内存缓存 + 启动期后台异步预热”设计，将菜单呼出前置耗时压降至 $< 0.05\text{ms}$，杜绝主线程阻塞与顿卡；
+  * 所有针对 Windows 计划任务的命令行调用强制配置 `CREATE_NO_WINDOW (0x08000000)` 创建标志，杜绝临时控制台黑框窗口闪烁；
 * **架构收益**：
   * ZenSearch 开机自动以高权限常驻，**无需触发 UAC 弹窗**，即可穿透 UIPI（用户界面特权隔离），向以管理员权限运行的软件（如专业 IDE、系统工具）所调起的文件对话框提供无缝路径注入。
 
@@ -196,6 +208,7 @@ if !single_instance::acquire() {
 | **焦点栈追踪 (Focus Stack)** | 资源管理器活动窗口精准判定 | 通过 `SetWinEventHook` 维护前台焦点栈，避免无序枚举，精准锁定用户交互的上一个活动 Explorer 窗口。 | [path_injection.md](file:///d:/ZenSearch/docs/features/path_injection.md) |
 | **对话框路径注入 (Quick Switch)** | 物理释放等待 + 焦点强锁 + 回环校验 | 等待鼠标物理左键（`VK_LBUTTON`）释放以完成点击结算，使用 `AttachThreadInput` + `SetFocus` 强行锁定 Edit 焦点，配合地址栏回环校验与最多 3 次重试自愈机制。 | [path_injection.md](file:///d:/ZenSearch/docs/features/path_injection.md) |
 | **UIPI 特权隔离穿透** | 计划任务高特权自启 | 安装期配置 `RunLevel: HighestAvailable` 计划任务，开机免 UAC 弹窗以管理员权限常驻，穿透 UIPI 向提权进程注入路径。 | 本文档 第三章 |
+| **系统托盘与自启轻量探测** | 注册表首检短路 + 计划任务 TTL 缓存 + `CREATE_NO_WINDOW` | 托盘右键呼出菜单时优先读取注册表并命中内存原子缓存，主线程无子进程阻塞延迟；所有外部命令强制加 `CREATE_NO_WINDOW` 隔离控制台黑框；`TrackPopupMenu` 后追加 `WM_NULL` 保证外部失焦即关。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **浮窗无状态重置 (Clean Slate)** | 唤醒即时重置管道 | 每次唤醒浮窗时强制清空输入框文本、清空候选模型、重置查询 Token、视口与选中索引归零，彻底隔绝前次状态残留。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **轻量浮窗与失焦收起** | `WS_EX_TOOLWINDOW` 与失焦即隐 | 设置 `WS_EX_TOOLWINDOW` 剥离任务栏占位；监听 `WM_ACTIVATE (WA_INACTIVE)` 及 `WM_KILLFOCUS` 实现点击外部区域即时无感隐去。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **双击 Ctrl 焦点穿透** | OS 前台锁穿透与输入框聚焦 | 调用 `AttachThreadInput` + `SetForegroundWindow` + `SetFocus` 穿透前台锁，联动 Slint `invoke_focus_input` 确保光标立即可键入。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |

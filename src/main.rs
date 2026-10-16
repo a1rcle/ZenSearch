@@ -72,6 +72,11 @@ fn main() {
     host::tray::start_tray_thread(event_tx.clone());
     core::window_helper::set_event_sender(event_tx.clone());
 
+    // 6.1 Prewarm autostart status asynchronously
+    std::thread::spawn(|| {
+        let _ = core::autostart::check_task_scheduler_startup();
+    });
+
     // 7. Initialize Slint GUI Windows
     let launcher = LauncherWindow::new().expect("Failed to create LauncherWindow");
     let companion = CompanionWindow::new().expect("Failed to create CompanionWindow");
@@ -91,7 +96,7 @@ fn main() {
                     let metrics = core::scale_manager::calculate_launcher_geometry(false, 0);
                     ui.window().set_size(slint::PhysicalSize::new(metrics.width as u32, metrics.height as u32));
                 } else {
-                    let results = core::everything::execute_query(&trimmed, 100);
+                    let results = core::everything::execute_ranked_query(&trimmed, 50, core::ranking::SearchContext::Launcher);
                     let slint_items: Vec<SearchItem> = results
                         .iter()
                         .map(|r| SearchItem {
@@ -127,8 +132,10 @@ fn main() {
         launcher.on_item_activated(move |idx| {
             if let Some(ui) = launcher_weak.upgrade() {
                 let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
                     let _ = std::process::Command::new("explorer").arg(&path).spawn();
                 }
                 ui.hide().ok();
@@ -143,8 +150,10 @@ fn main() {
         launcher.on_item_open_folder(move |idx| {
             if let Some(ui) = launcher_weak.upgrade() {
                 let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
                     core::explorer::open_in_new_explorer_and_select(&path);
                 }
                 ui.hide().ok();
@@ -183,7 +192,7 @@ fn main() {
                     } else {
                         trimmed
                     };
-                    let results = core::everything::execute_query(&full_query, 10);
+                    let results = core::everything::execute_ranked_query(&full_query, 10, core::ranking::SearchContext::Companion);
                     let slint_items: Vec<SearchItem> = results
                         .iter()
                         .map(|r| SearchItem {
@@ -225,8 +234,10 @@ fn main() {
         companion.on_item_activated(move |idx| {
             if let Some(ui) = comp_weak.upgrade() {
                 let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
                     let _ = std::process::Command::new("explorer").arg(&path).spawn();
                 }
                 ui.hide().ok();
@@ -244,8 +255,10 @@ fn main() {
         companion.on_item_open_folder(move |idx| {
             if let Some(ui) = comp_weak.upgrade() {
                 let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
                     core::explorer::open_in_new_explorer_and_select(&path);
                 }
                 ui.hide().ok();
@@ -476,7 +489,10 @@ fn run_diagnose() {
     let task_ok = core::autostart::check_task_scheduler_startup();
     let reg_ok = core::autostart::check_registry_startup();
     println!("  - 计划任务特权自启 (ZenSearch_Startup): {}", if task_ok { "已配置 (免 UAC 穿透)" } else { "未配置" });
-    println!("  - 注册表普通自启 (HKCU\\Run): {}", if reg_ok { "已配置" } else { "未配置" });
+    println!("  - 注册表普通自启 (HKCU\\Run): {}", if reg_ok { "已配置并验证有效" } else { "未配置或指向无效路径" });
+    if let Some(cmd) = core::autostart::get_registry_startup_command() {
+        println!("  - 当前注册表启动命令: {}", cmd);
+    }
 
     // 6. 单实例与多进程健康度
     println!("\n[6/6] 单实例与互斥体状态:");

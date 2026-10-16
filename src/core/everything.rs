@@ -225,3 +225,40 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
 
     QueryOutput::default()
 }
+
+pub fn execute_ranked_query(
+    query: &str,
+    max_results: u32,
+    context: crate::core::ranking::SearchContext,
+) -> QueryOutput {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryOutput::default();
+    }
+
+    // Two-stage ranking: fetch a broader candidate pool (up to 200 items)
+    let candidate_pool_size = (max_results * 10).max(100).min(300);
+    let raw_output = execute_query(query, candidate_pool_size);
+
+    if raw_output.results.is_empty() {
+        return raw_output;
+    }
+
+    // Rank candidates using ZenSearch ranking algorithm
+    let history = crate::core::ranking::HistoryManager::global();
+    let ranked = crate::core::ranking::Ranker::rank(
+        raw_output.results,
+        trimmed,
+        context,
+        &history,
+    );
+
+    // Truncate to desired max_results
+    let final_results: Vec<SearchResult> = ranked.into_iter().take(max_results as usize).collect();
+
+    QueryOutput {
+        results: final_results,
+        total_matched: raw_output.total_matched,
+    }
+}
+

@@ -133,18 +133,110 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
 }
 ```
 
-### 5. 检索与展示核心规范
+### 5. 宽进精排架构与 Listary 级多维排序算法
 
-1. **智能全路径匹配（Smart MatchPath）**：
-   - 当用户查询词中包含空格、反斜杠 `\` 或正斜杠 `/` 时（如 `ZenSearch main`、`workspace/src`），自动开启 `MatchPath(1)`，允许跨路径层级联合检索；
-   - 纯单个标识符搜索时使用 `MatchPath(0)`，专注于叶子文件名的高速精准召回。
-2. **查询状态彻底复位**：
-   - 每次 IPC 请求前重置大小写、全字匹配与正则标志位，杜绝被前序会话或外界全局设置污染。
-3. **权威时间降序排序（Recency-First Sorting）**：
-   - 采用 Everything 原生引擎支持的 `EVERYTHING_SORT_DATE_MODIFIED_DESCENDING (14)`（修改日期降序），使活跃工作集、最新保存文档与新建工程自动排在首位，完全契合启动器使用直觉。
-4. **配额与性能平衡**：
-   - 主搜索浮窗全局查询默认单次召回上限设定为 **100 条**；
-   - 结合 Slint `ListView` 自适应视口与键盘最小滚动跟随，兼顾海量候选覆盖与 60FPS 流畅滚动。
+为提供最契合直觉与肌肉记忆的候选排序，系统采用**宽进精排（Two-Stage Ranking）**架构：底层 Everything 负责毫秒级全盘粗筛，Rust 精排引擎进行多维复合评分与历史加权，输出最优 Top N。
+
+```
++───────────────────────────────────────────────────────────────────────────────────+
+|                        ZenSearch 宽进精排流水线 (Two-Stage Ranking)                |
++───────────────────────────────────────────────────────────────────────────────────+
+  用户输入 Query ──► Everything SDK 粗排召回 (候选池 100~300 条)
+                                │
+                                ▼
+                   ZenSearch 精排计算引擎 (Ranker)
+       ┌────────────────────────┼────────────────────────┐
+       ▼                        ▼                        ▼
+  [ 文本匹配分 S_match ]   [ 自适应历史分 S_history ] [ 场景上下文分 S_type ]
+  • 全字/主干完全匹配       • Query 专属强绑定       • Launcher: 可执行程序优先
+  • 文件名/主干前缀匹配     • 使用频次对数加权        • Companion: 文件夹优先
+  • 连续子串位置加成       • 3天半衰期指数时间衰减               │
+  • 驼峰/首字母缩写匹配                  │                        ▼
+       │                                │             [ 路径惩罚分 S_path ]
+       │                                │             • 目录深度层级递减
+       │                                │             • 噪声目录强制压底
+       └────────────────────────┬───────┴────────────────────────┘
+                                │
+                                ▼
+                     综合总分降序重排 (TotalScore)
+                                │
+                                ▼
+                   截取 Top N 提交 Slint UI 渲染
+                                │
+                   用户回车激活 / 打开所在目录
+                                │
+                                ▼ (异步持久化)
+                   HistoryManager (%APPDATA%/ZenSearch/history.tsv)
+```
+
+#### 1. 评分维度与算法公式
+每个候选结果的最终排序得分由四个维度复合计算：
+$$\text{TotalScore} = S_{\text{match}} + S_{\text{history}} + S_{\text{type}} + S_{\text{path}}$$
+
+* **文本匹配分 ($S_{\text{match}}$，基础核心权重)**：
+  * **完全全字匹配（Exact Match）**：文件名或主干去除扩展名后完全相符，给予最高基础分（`+12,000`）；
+  * **前缀匹配（Prefix Match）**：文件名以搜索词开头（`+6,000`），主干以搜索词开头（`+5,500`）；
+  * **连续子串匹配（Substring Match）**：连续出现在文件名中，并根据命中位置越靠近首部给予递增加成（`+1,000 ~ +3,000`）；
+  * **缩写/首字母匹配（Acronym Match）**：支持单词首字母与 CamelCase 驼峰匹配（如 `vsc` 命中 `Visual Studio Code.exe`，`+4,500`）；
+  * **紧凑度惩罚**：文件名相比搜索词过长时进行微量扣分，保证匹配越紧凑排名越前；
+  * **纯父路径命中惩罚**：若搜索词仅命中父目录而未命中文件名，得分大幅衰减（仅 `+300`）。
+
+* **自适应学习与使用习惯分 ($S_{\text{history}}$，动态演进权重)**：
+  * **Query 记忆绑定（Query-Specific Boost）**：当用户曾输入该特定 Query 并回车启动过某文件时，直接赋予极高专项加成（`+15,000`），达成肌肉记忆秒开；
+  * **总打开频次（Frequency）**：采用对数递增模型 $\log_2(\text{launch\_count} + 1) \times 600$，防止高频项长期永久压制；
+  * **时间新鲜度（Recency 时间半衰期衰减）**：
+    $$\text{Score}_{\text{recency}} = 3000 \times 2^{-\frac{\Delta t}{T_{\text{half}}}}$$
+    其中半衰期设定为 3 天（$T_{\text{half}} = 259,200\text{s}$）。刚访问过的文件获得前列置顶，随着时间推移自然平滑回归基准线。
+
+* **场景上下文与类型分 ($S_{\text{type}}$)**：
+  * **主启动器上下文（`SearchContext::Launcher`）**：`.exe`、`.lnk`、`.bat`、`.cmd`、`.appref-ms` 等可执行程序获得优先加分（`+2,000`）；
+  * **资源管理器随行上下文（`SearchContext::Companion`）**：目录/文件夹获得专属加分（`+2,500`），无缝满足资源管理器穿梭跳转需求。
+
+* **路径深度与噪声目录抑制 ($S_{\text{path}}$)**：
+  * **深度层级惩罚**：路径每多一级目录惩罚 40 分，避免深层无关嵌套项刷屏；
+  * **噪声目录强力打压**：针对 `node_modules`、`.git`、`target\debug`、`target\release`、`AppData\Local\Temp`、`$Recycle.Bin` 等编译中间件或缓存路径，强行扣除 `6,000` 分沉底。
+
+#### 2. 接口实现规范 (`src/core/everything.rs` & `src/core/ranking/`)
+
+```rust
+pub fn execute_ranked_query(
+    query: &str,
+    max_results: u32,
+    context: SearchContext,
+) -> QueryOutput {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryOutput::default();
+    }
+
+    // 1. 宽进粗排：向 Everything 底层拉取 100~300 条候选池
+    let candidate_pool_size = (max_results * 10).max(100).min(300);
+    let raw_output = execute_query(query, candidate_pool_size);
+
+    if raw_output.results.is_empty() {
+        return raw_output;
+    }
+
+    // 2. 精排计算：调用 Ranker 综合评分重排
+    let history = HistoryManager::global();
+    let ranked = Ranker::rank(raw_output.results, trimmed, context, &history);
+
+    // 3. 截取 Top N 提交渲染
+    let final_results: Vec<SearchResult> = ranked.into_iter().take(max_results as usize).collect();
+
+    QueryOutput {
+        results: final_results,
+        total_matched: raw_output.total_matched,
+    }
+}
+```
+
+#### 3. 用户交互正向反馈机制
+* 当用户在浮窗中按下回车激活项（`on_item_activated`）或右键直接定位所在目录（`on_item_open_folder`）时，自动触发：
+  ```rust
+  core::ranking::HistoryManager::global().record_launch(&query, &path);
+  ```
+* 记录原子化更新至单例状态，并实时异步持久化至用户目录 `%APPDATA%\ZenSearch\history.tsv`，保证下次同类查询立即可用。
 
 
 ---
@@ -518,7 +610,7 @@ ZenSearch 采用键鼠对称的一致性操作模型，兼顾全键盘效率流�
 
 ---
 
-## 五、 后台常驻守护与窗口生命周期解耦 (Daemon Lifecycle & Esc Dismissal)
+## 五、 后台常驻守护、系统托盘与自启架构规范 (Daemon Lifecycle, System Tray & Autostart)
 
 ### 1. 守护常驻原则 (Resident Daemon Principle)
 * **后台静默常驻**：程序启动后（支持 `--silent` 开机自启），主进程转入后台系统托盘守护态（`Shell_NotifyIconW`）；
@@ -533,9 +625,74 @@ ZenSearch 采用键鼠对称的一致性操作模型，兼顾全键盘效率流�
 * **事件循环保活**：强制采用 `slint::run_event_loop_until_quit()` 替代默认的 `run_event_loop()`，切断“无可见窗口”与“退出事件循环”之间的级联关联，确保浮窗隐藏后后台钩子与托盘持续保活；
 * **退出机制严格收口**：全局仅允许系统托盘右键菜单“退出 ZenSearch”或显式终止指令（如升级安装器）终止进程。
 
-### 3. Windows 子系统与无控制台黑框规范 (`windows_subsystem`)
-* 声明 `#![windows_subsystem = "windows"]`，开机自启与常规运行时无任何终端黑框；
-* 针对 `--diagnose`（健康体检）与 `--diagnose-watch`（击键监控）等 CLI 诊断场景，在启动初期通过 `AttachConsole(ATTACH_PARENT_PROCESS)` 动态挂载父终端控制台输出信息。
+### 3. Windows GUI 子系统与外部进程控制台隔离规范 (`windows_subsystem` & `CREATE_NO_WINDOW`)
+* **GUI 子系统声明**：主程序入口显式声明 `#![windows_subsystem = "windows"]`，开机自启与常规运行时主进程不创建或绑定任何终端黑框；
+* **CLI 诊断动态附着**：针对 `--diagnose`（健康体检）与 `--diagnose-watch`（击键监控）等 CLI 诊断场景，在启动初期通过 `AttachConsole(ATTACH_PARENT_PROCESS)` 动态挂载父终端控制台输出信息；
+* **外部子进程控制台隔离**：在 GUI 子系统下，通过 `std::process::Command` 调用任何 Windows 外部控制台程序（如 `schtasks`）时，**必须显式配置 `CREATE_NO_WINDOW (0x08000000)` 创建标志**，禁止 Windows 系统为子进程分配或弹出临时控制台窗口：
+  ```rust
+  use std::os::windows::process::CommandExt;
+  const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+  let mut cmd = Command::new("schtasks");
+  #[cfg(windows)]
+  cmd.creation_flags(CREATE_NO_WINDOW);
+  let output = cmd.args(["/Query", "/TN", TASK_NAME]).output();
+  ```
+
+### 4. 原生系统托盘与右键菜单无阻塞生命周期规范 (Native System Tray & Menu Lifecycle)
+* **独立宿主线程**：系统托盘（`ZenSearch_Tray_Class` / `ZenSearch_Tray_Window`）在独立后台线程运行专属 Win32 消息泵，与 Slint UI 线程完全解耦，互不干扰；
+* **图标事件映射**：
+  * 鼠标左键单击 / 双击（`WM_LBUTTONUP` / `WM_LBUTTONDBLCLK`）：通过 crossbeam 事件通道向 UI 线程发送 `AppEvent::ToggleLauncher` 触发浮窗唤醒；
+  * 鼠标右键抬起（`WM_RBUTTONUP`）：呼出上下文操作菜单。
+* **Win32 弹窗菜单焦点规范**：根据 Windows Shell 菜单最佳实践，呼出与销毁严格遵循三步走时序：
+  ```rust
+  // 1. 将托盘隐藏宿主窗口置于前台，使菜单拥有合法的顶级输入焦点
+  let _ = SetForegroundWindow(hwnd);
+
+  // 2. 阻塞式跟踪弹出菜单，获取用户点击项
+  let cmd = TrackPopupMenu(
+      hmenu,
+      TPM_RETURNCMD | TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+      pt.x,
+      pt.y,
+      0,
+      hwnd,
+      None,
+  );
+
+  // 3. 核心失焦释放：发送空消息解除前台锁定，确保用户点击外部区域时菜单瞬间无感隐去
+  let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+  let _ = DestroyMenu(hmenu);
+  ```
+
+### 5. 开机自启动管理与轻量无感状态嗅探规范 (Autostart Architecture & Non-blocking Query)
+ZenSearch 采用**双通道协同自启架构**，兼顾高特权免 UAC 穿透与常规无损读写，并通过轻量嗅探保障托盘交互零卡顿：
+
+```
++---------------------------------------------------------------------------------------+
+|                              开机自启动双通道协同机制                                  |
++---------------------------------------------------------------------------------------+
+|  [ 通道 A: 注册表常规通道 ] ──> HKCU\Software\Microsoft\Windows\CurrentVersion\Run     |
+|       ├── 适用场景: 用户通过托盘菜单开关自启、普通权限运行环境                       |
+|       └── 核心特性: 原生 Win32 API (RegOpenKeyExW / RegQueryValueExW) 纳秒级直接读写   |
+|  [ 通道 B: 计划任务特权通道 ] ──> Windows Task Scheduler (ZenSearch_Startup)           |
+|       ├── 适用场景: Inno Setup 管理员安装、以最高特权 (HighestAvailable) 静默启动     |
+|       └── 核心特性: 免 UAC 弹窗常驻，穿透 UIPI 向以管理员运行的应用对话框注入路径    |
++---------------------------------------------------------------------------------------+
+```
+
+* **极速无感状态判断（注册表首检短路）**：
+  在托盘右键构建菜单时，`is_autostart_enabled()` 优先执行基于纯 Win32 原生 API 的注册表探测（`check_registry_startup()`），耗时 $< 0.05\text{ms}$ 且无任何子进程开销。若注册表已配置，立即短路返回 `true`，杜绝调用外部进程。
+* **计划任务状态 TTL 内存缓存机制**：
+  针对计划任务通道（`check_task_scheduler_startup()`），引入 60 秒 TTL 内存缓存与原子标志位（`TASK_SCHEDULER_CACHED_STATUS`）。托盘高频右键时直接读取内存布尔值，杜绝重复创建 `schtasks` 进程引发的主线程顿卡。
+* **主程序启动期异步预热**：
+  在 `main.rs` 启动阶段通过后台子线程异步预热计划任务自启状态，确保用户首次右键系统托盘时缓存已命中，达成系统托盘菜单 **0ms 极速呼出**：
+  ```rust
+  // main.rs 启动流水线中异步预热自启状态
+  std::thread::spawn(|| {
+      let _ = core::autostart::check_task_scheduler_startup();
+  });
+  ```
 
 ---
 

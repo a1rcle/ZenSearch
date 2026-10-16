@@ -9,10 +9,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    GetCursorPos, GetMessageW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     TrackPopupMenu, TranslateMessage, HICON, HMENU, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR,
     MF_STRING, MF_UNCHECKED, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WINDOW_EX_STYLE,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
 };
 use crate::core::hotkey::AppEvent;
 
@@ -87,6 +87,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         hwnd,
         None,
     );
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
 
     let _ = DestroyMenu(hmenu);
 
@@ -100,9 +101,17 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         }
         CMD_TOGGLE_AUTOSTART => {
             if crate::core::autostart::is_autostart_enabled() {
-                let _ = crate::core::autostart::disable_registry_autostart();
+                if let Err(e) = crate::core::autostart::disable_autostart() {
+                    tracing::error!("Failed to disable autostart: {}", e);
+                } else {
+                    tracing::info!("Autostart successfully disabled");
+                }
             } else {
-                let _ = crate::core::autostart::enable_registry_autostart();
+                if let Err(e) = crate::core::autostart::enable_autostart() {
+                    tracing::error!("Failed to enable autostart: {}", e);
+                } else {
+                    tracing::info!("Autostart successfully enabled");
+                }
             }
         }
         CMD_EXIT => {

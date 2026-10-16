@@ -5,6 +5,7 @@ pub mod core {
     pub mod hotkey;
     pub mod icon_provider;
     pub mod injector;
+    pub mod ranking;
     pub mod scale_manager;
     pub mod single_instance;
     pub mod window_helper;

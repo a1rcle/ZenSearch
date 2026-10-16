@@ -147,7 +147,11 @@ pub fn get_explorer_path(target_hwnd: HWND) -> Option<String> {
 
 ```rust
 let search_query = format!("path:\"{}\" {}", current_dir, kw);
-let results = crate::core::everything::execute_query(&search_query, 30);
+let results = crate::core::everything::execute_ranked_query(
+    &search_query,
+    10,
+    crate::core::ranking::SearchContext::Companion,
+);
 ```
 
 ### 3. 候选项独立定位交互规范 (`Ctrl + O` 与鼠标右键)
