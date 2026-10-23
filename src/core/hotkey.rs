@@ -127,7 +127,10 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
                     let alt_down = (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0
                         || (GetAsyncKeyState(VK_RMENU.0 as i32) as u16 & 0x8000) != 0;
 
-                    if !is_modifier && !is_control_key && !ctrl_down && !alt_down {
+                    let win_down = (GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000) != 0
+                        || (GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000) != 0;
+
+                    if !is_modifier && !is_control_key && !ctrl_down && !alt_down && !win_down {
                         // Check focused element, focused child window class, or active menu
                         let is_busy = is_explorer_editing_or_menu_active(fg);
                         if !is_busy {

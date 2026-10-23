@@ -44,14 +44,77 @@ flowchart TD
 ### 2. 规则定义
 
 * **完全放行规则**：
-  * **控制与功能键**：`Ctrl` / `Alt` / `Win` 组合键、`Enter`、`Escape`、`Tab`、`Delete`、`Backspace`、`F1`~`F12`、方向键、`CapsLock` 等；
+  * **系统修饰键与组合键穿透**：
+    * **修饰键自身放行**：当击键本身为修饰键（`VK_LCONTROL`、`VK_RCONTROL`、`VK_LMENU`、`VK_RMENU`、`VK_LWIN`、`VK_RWIN`）时，直接放行；
+    * **组合键物理状态穿透**：通过物理状态读取接口（`GetAsyncKeyState`）判定 `Ctrl`、`Alt` 或 `Win` 键是否处于激活按压状态。凡属于携带 `Ctrl`（如 `Ctrl + C / V / Z / A`）、`Alt`（如 `Alt + D / Enter`）或 `Win`（如 `Win + E` 打开新窗口、`Win + D` 显示桌面、`Win + R` 运行、`Win + X` 快捷菜单等）的任何组合键操作，必须无条件完全放行传递给系统，严禁拦截或吞噬按键；
+  * **控制与功能键**：`Enter`、`Escape`、`Tab`、`Delete`、`Backspace`、`F1`~`F12`、方向键、`CapsLock` 等系统与导航按键完全放行；
   * **模态菜单态**：检测到右键上下文菜单、窗口系统菜单或下拉菜单激活时，放行所有按键（保障单键加速键盲操体验）；
   * **输入控件态**：焦点处于原生地址栏（`Address Band Root`）、搜索框或重命名编辑框（`Edit`）时，放行所有击键。
 * **拦截与激活规则**：
   * 当焦点位于资源管理器展示区且未处于菜单与编辑状态时，捕获首个有效字符（`a-z`、`0-9`、空格）；
   * 吞掉（Eat）该击键事件（返回 `LRESULT(1)`），通过通道发送 `AppEvent::OpenCompanion`，并将首字符注入随行输入框。
 
-### 3. 模态菜单与编辑状态感知实现
+### 3. 低级键盘钩子修饰键与按键过滤实现规范
+
+随行模块键盘钩子（`WH_KEYBOARD_LL`）遵循零堆分配与无锁规范，通过物理键态检测保证系统全局组合键的绝对穿透：
+
+```rust
+// 1. 基础修饰键单键过滤
+let is_modifier = vk == VK_LCONTROL.0
+    || vk == VK_RCONTROL.0
+    || vk == VK_LMENU.0
+    || vk == VK_RMENU.0
+    || vk == VK_LWIN.0
+    || vk == VK_RWIN.0;
+
+let is_control_key = vk == VK_RETURN.0
+    || vk == VK_ESCAPE.0
+    || vk == VK_TAB.0
+    || vk == VK_DELETE.0
+    || vk == VK_BACK.0
+    || vk == VK_F2.0
+    || vk == VK_F5.0
+    || (vk >= VK_F1.0 && vk <= VK_F12.0)
+    || vk == VK_LEFT.0
+    || vk == VK_RIGHT.0
+    || vk == VK_UP.0
+    || vk == VK_DOWN.0
+    || vk == VK_CAPITAL.0;
+
+// 2. 修饰键全局物理按压状态检测 (高位 0x8000 表示按压中)
+let ctrl_down = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+let alt_down = (GetAsyncKeyState(VK_LMENU.0 as i32) as u16 & 0x8000) != 0
+    || (GetAsyncKeyState(VK_RMENU.0 as i32) as u16 & 0x8000) != 0;
+let win_down = (GetAsyncKeyState(VK_LWIN.0 as i32) as u16 & 0x8000) != 0
+    || (GetAsyncKeyState(VK_RWIN.0 as i32) as u16 & 0x8000) != 0;
+
+// 3. 仅当无任何修饰键按压且非控制键时，方进入随行输入检测
+if !is_modifier && !is_control_key && !ctrl_down && !alt_down && !win_down {
+    let is_busy = is_explorer_editing_or_menu_active(fg);
+    if !is_busy {
+        let ch = match vk {
+            0x30..=0x39 => Some((b'0' + (vk - 0x30) as u8) as char),
+            0x41..=0x5A => Some((b'a' + (vk - 0x41) as u8) as char),
+            _ if vk == VK_SPACE.0 => Some(' '),
+            _ => None,
+        };
+
+        if let Some(c) = ch {
+            if let Ok(lock) = EVENT_SENDER.lock() {
+                if let Some(tx) = lock.as_ref() {
+                    let _ = tx.try_send(AppEvent::OpenCompanion {
+                        initial_char: Some(c),
+                        explorer_hwnd: fg.0 as isize,
+                    });
+                }
+            }
+            return LRESULT(1); // 消费该按键并唤醒随行条
+        }
+    }
+}
+```
+
+### 4. 模态菜单与编辑状态感知实现
 
 利用 Win32 `GetGUIThreadInfo` 读取资源管理器 UI 线程内部状态：
 
