@@ -104,16 +104,26 @@ cargo run -- --diagnose-watch
 * **测试规范**：
   1. **完全匹配与前缀匹配置顶**：全字相等或前缀命中必须显著高于包含匹配；
   2. **首字母缩写识别**：多词组合首字母（如 `vsc`）必须优先识别目标程序；
-  3. **脏目录抑制**：`node_modules`、`.git`、`target\debug` 等噪音路径自动扣分沉底；
+  3. **脏目录与 Recent 抑制**：`node_modules`、`.git`、`target\debug` 以及 Windows/Office Recent 目录等噪音路径自动扣除 6,000 分沉底；
   4. **自适应 Query 记忆绑定**：用户激活过特定项后，再次输入相同 query 必须保证最高加分（`+15,000`）稳居第一。
 * **执行命令**：
   ```powershell
   cargo test --test test_ranking_algorithm
   ```
 
+### 6. 快捷方式与 Recent 目录双层全局排除验证
+* **测试规范**：
+  1. **L1 引擎语法改写**：验证 `build_effective_query` 自动追加 `!*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*"` 排除语法；
+  2. **L2 客户端内存兜底**：验证 `is_excluded` 对所有 `.lnk` 快捷方式以及 Windows/Office Recent 路径实施 100% 内存拦截；
+  3. **常规文件零误杀**：验证常规物理文档、目录及应用程序不受任何影响。
+* **执行命令**：
+  ```powershell
+  cargo test --test test_search_query
+  ```
+
 ---
 
-## 六、 故障排查手册 (Troubleshooting Playbook)
+## 七、 故障排查手册 (Troubleshooting Playbook)
 
 | 异常现象 | 可能诱因 | 推荐排查与解决步骤 |
 | :--- | :--- | :--- |

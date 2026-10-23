@@ -46,7 +46,8 @@ ZenSearch 是一款面向 Windows 平台的高性能桌面启动与搜索增强�
 |  [ 2. 搜索服务与排序引擎中台 (Search & Ranking Engine) ]                             |
 |       ├── Everything-SDK 原生 FFI 绑定与状态机复位管道                                 |
 |       ├── 宽进精排架构 (Everything 粗排 100~300 条候选 + Rust 纳秒级精排)              |
-|       ├── 综合多维打分引擎 (全字/前缀/子串/缩写/深度惩罚/脏目录抑制)                   |
+|       ├── 全局纯净排除与双层拦截 (L1 查询改写 !*.lnk !Recent + L2 内存 is_excluded 过滤)|
+|       ├── 综合多维打分引擎 (全字/前缀/子串/缩写/深度惩罚/脏目录与Recent强力抑制)      |
 |       ├── 自适应使用学习与 Query 记忆绑定 (半衰期指数时间衰减模型)                      |
 |       ├── 场景上下文感知 (Launcher 可执行文件优先 / Companion 目录优先)                |
 |       ├── 随包捆绑 Everything 进程守护与静默拉起器 (-startup)                         |
@@ -110,7 +111,7 @@ ZenSearch/
 │   ├── lib.rs                    # 核心库导出与集成测试入口
 │   ├── core/                     # 系统核心服务
 │   │   ├── autostart.rs          # 计划任务与注册表自启动管理
-│   │   ├── everything.rs         # Everything-SDK FFI 接口与守护进程拉起
+│   │   ├── everything.rs         # Everything-SDK FFI 接口、全局排除注入与守护进程拉起
 │   │   ├── explorer.rs           # IShellWindows COM 互操作、路径提取与独立窗口定位
 │   │   ├── hotkey.rs             # WH_KEYBOARD_LL 键盘钩子与双击状态机
 │   │   ├── icon_provider.rs      # Win32 Shell 原生图标提取与零 I/O 双级缓存
@@ -130,8 +131,8 @@ ZenSearch/
 │       └── paths.rs              # 标准目录解析 (%APPDATA%, %LOCALAPPDATA%)
 ├── tests/                        # 集成与自动化测试套件
 │   ├── test_path_injection.rs    # 对话框路径注入模拟集成测试
-│   ├── test_ranking_algorithm.rs # 综合排序算法与自适应学习单元测试
-│   ├── test_search_query.rs      # Everything 语义与 Deref 规范测试
+│   ├── test_ranking_algorithm.rs # 综合排序算法、Recent 路径惩罚与自适应学习单元测试
+│   ├── test_search_query.rs      # Everything 语义、全局排除注入与 Deref 规范测试
 │   └── test_ui_scale.rs          # 高 DPI 与窗口缩放推导单元测试
 ├── installer/                    # 安装包工程
 │   ├── zensearch.iss             # Inno Setup 编译脚本

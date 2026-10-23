@@ -67,21 +67,59 @@ impl std::ops::Deref for QueryOutput {
 }
 ```
 
-### 4. 检索执行管道与调度规范 (`execute_query`)
+### 4. 检索执行管道与纯净排除机制 (`execute_query`)
+
+ZenSearch 坚持**真实磁盘物理文件优先**原则，在检索流水线中严格实施全局纯净排除规范：
+* **全局屏蔽快捷方式 (`*.lnk`)**：任何目录下的快捷方式文件彻底不出现在搜索结果中，用户直达物理实体文件；
+* **全局屏蔽 Recent 历史目录**：屏蔽包含 `*\AppData\Roaming\Microsoft\Windows\Recent\*` 与 `*\AppData\Roaming\Microsoft\Office\Recent\*` 的所有条目；
+* **双层协同拦截体系（Defense in Depth）**：
+  1. **L1 引擎层源头阻断（Query Rewriting）**：调用 `build_effective_query` 在用户查询词后自动注入 Everything 排除语法 `!*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*"`，由 Everything 索引在 C FFI 内部跳过，确保召回的 100~300 条候选全量由真实物理文件填满；
+  2. **L2 客户端内存兜底（In-Memory Filter）**：遍历结果集时执行 `is_excluded(&path, &filename)` 双重校验，彻底拦截特殊通配场景下的残存项。
 
 ```rust
+/// 检查文件是否处于全局排除名单中
+pub fn is_excluded(path: &str, filename: &str) -> bool {
+    let lower_name = filename.to_lowercase();
+    // 1. 全局排除所有 .lnk 快捷方式
+    if lower_name.ends_with(".lnk") {
+        return true;
+    }
+
+    // 2. 排除 Windows 及 Office Recent 目录
+    let lower_path = path.to_lowercase();
+    if lower_path.contains(r"\appdata\roaming\microsoft\windows\recent")
+        || lower_path.contains(r"\appdata\roaming\microsoft\office\recent")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// 组装注入排除条件的最终 Everything 查询语句
+pub fn build_effective_query(raw_query: &str) -> String {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 注入全局排除规则：排除所有 .lnk 以及 Windows Recent 目录
+    format!(r#"{} !*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*""#, trimmed)
+}
+
 pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return QueryOutput::default();
     }
 
-    let wide_query: Vec<u16> = OsStr::new(trimmed)
+    // 使用带有排除条件的有效查询词
+    let effective_query = build_effective_query(trimmed);
+    let wide_query: Vec<u16> = OsStr::new(&effective_query)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
 
-    // 智能全路径匹配判定：包含空格或路径分隔符时启用全路径比对，否则按纯文件名匹配
+    // 智能全路径匹配判定：针对原始输入判定是否启用全路径比对
     let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
         1
     } else {
@@ -95,7 +133,7 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
         Everything_SetRegex(0);
         Everything_SetMatchPath(enable_match_path);
 
-        // 2. 注入查询与请求字段
+        // 2. 注入有效查询与请求字段
         Everything_SetSearchW(wide_query.as_ptr());
         Everything_SetRequestFlags(0x00000001 | 0x00000002); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Everything_SetMax(max_results);
@@ -117,7 +155,11 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.clone());
-                    results.push(SearchResult { path, filename });
+
+                    // L2 客户端内存兜底过滤
+                    if !is_excluded(&path, &filename) {
+                        results.push(SearchResult { path, filename });
+                    }
                 }
             }
             return QueryOutput { results, total_matched };
@@ -141,7 +183,10 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
 +───────────────────────────────────────────────────────────────────────────────────+
 |                        ZenSearch 宽进精排流水线 (Two-Stage Ranking)                |
 +───────────────────────────────────────────────────────────────────────────────────+
-  用户输入 Query ──► Everything SDK 粗排召回 (候选池 100~300 条)
+  用户输入 Query ──► L1: 查询改写注入 (!*.lnk !Recent) ──► Everything SDK 粗排召回 (候选池 100~300 条)
+                                                                 │
+                                                                 ▼
+                                                    L2: 客户端内存兜底过滤 (is_excluded)
                                 │
                                 ▼
                    ZenSearch 精排计算引擎 (Ranker)
@@ -189,12 +234,12 @@ $$\text{TotalScore} = S_{\text{match}} + S_{\text{history}} + S_{\text{type}} + 
     其中半衰期设定为 3 天（$T_{\text{half}} = 259,200\text{s}$）。刚访问过的文件获得前列置顶，随着时间推移自然平滑回归基准线。
 
 * **场景上下文与类型分 ($S_{\text{type}}$)**：
-  * **主启动器上下文（`SearchContext::Launcher`）**：`.exe`、`.lnk`、`.bat`、`.cmd`、`.appref-ms` 等可执行程序获得优先加分（`+2,000`）；
+  * **主启动器上下文（`SearchContext::Launcher`）**：`.exe`、`.bat`、`.cmd`、`.appref-ms` 等物理可执行程序获得优先加分（`+2,000`）；（快捷方式 `.lnk` 处于全局排除名单，不参与任何可执行加分）；
   * **资源管理器随行上下文（`SearchContext::Companion`）**：目录/文件夹获得专属加分（`+2,500`），无缝满足资源管理器穿梭跳转需求。
 
 * **路径深度与噪声目录抑制 ($S_{\text{path}}$)**：
   * **深度层级惩罚**：路径每多一级目录惩罚 40 分，避免深层无关嵌套项刷屏；
-  * **噪声目录强力打压**：针对 `node_modules`、`.git`、`target\debug`、`target\release`、`AppData\Local\Temp`、`$Recycle.Bin` 等编译中间件或缓存路径，强行扣除 `6,000` 分沉底。
+  * **噪声目录强力打压**：针对 `node_modules`、`.git`、`target\debug`、`target\release`、`AppData\Local\Temp`、`$Recycle.Bin` 以及 `AppData\Roaming\Microsoft\Windows\Recent`、`AppData\Roaming\Microsoft\Office\Recent` 等编译中间件、缓存与历史路径，强行扣除 `6,000` 分沉底。
 
 #### 2. 接口实现规范 (`src/core/everything.rs` & `src/core/ranking/`)
 
@@ -702,7 +747,7 @@ ZenSearch 采用**双通道协同自启架构**，兼顾高特权免 UAC 穿透�
 ZenSearch 候选列表与 Windows 原生 Shell 图标体系完全对齐：
 * **文件夹（Directory）**：呈现系统标准黄色文件夹图标；
 * **各类关联文档**：`.txt`、`.pdf`、`.docx`、`.zip` 等精准展示用户当前系统关联软件专属图标；
-* **可执行程序（.exe/.lnk）**：精准提取呈现内嵌专属 LOGO 图标；
+* **可执行程序（.exe 等）**：精准提取呈现内嵌专属 LOGO 图标；
 * **高分屏与透明通道**：保留 32 位 Alpha 通道与抗锯齿，高 DPI 环境下清晰锐利。
 
 ### 2. 零磁盘 I/O 设计准则 (Zero-I/O Caching)
@@ -744,7 +789,7 @@ impl CachedIcon {
 * **一级：扩展名全局常驻缓存 (`EXT_CACHE: LazyLock<RwLock<HashMap<String, CachedIcon>>>`)**：
   * 常规后缀与文件夹在内存中全生命周期仅提取一份，命中耗时仅 10~50 纳秒；
 * **二级：实体可执行程序 LRU 缓存 (`EXE_CACHE: LazyLock<RwLock<HashMap<PathBuf, CachedIcon>>>`)**：
-  * 针对 `.exe`、`.lnk` 等具备独立内嵌图标的程序，按绝对路径哈希并限制上限 200 项，防止内存无序增长；
+  * 针对 `.exe` 等具备独立内嵌图标的程序，按绝对路径哈希并限制上限 200 项，防止内存无序增长；
 * **开机静默预热 (`icon_provider::init()`)**：
   * 随主进程启动在后台预热常见核心类型（文件夹、txt、docx、pdf、zip、png、exe 等），保障首次敲击即 100% 内存命中。
 

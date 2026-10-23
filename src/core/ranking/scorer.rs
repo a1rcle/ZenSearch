@@ -139,7 +139,7 @@ impl Ranker {
         // -------------------------------------------------------------
         // 3. File Type & Contextual Relevance (S_type)
         // -------------------------------------------------------------
-        let is_executable = matches!(ext.as_str(), "exe" | "lnk" | "bat" | "cmd" | "appref-ms");
+        let is_executable = matches!(ext.as_str(), "exe" | "bat" | "cmd" | "appref-ms");
         let is_dir = Path::new(&res.path).is_dir();
 
         match context {
@@ -171,6 +171,8 @@ impl Ranker {
             || path_lower.contains(r"\target\release\")
             || path_lower.contains(r"\appdata\local\temp\")
             || path_lower.contains(r"\$recycle.bin\")
+            || path_lower.contains(r"\appdata\roaming\microsoft\windows\recent\")
+            || path_lower.contains(r"\appdata\roaming\microsoft\office\recent\")
         {
             score -= 6_000;
         }

@@ -168,17 +168,49 @@ pub fn ensure_everything_service() -> bool {
     false
 }
 
+/// 检查文件是否处于全局排除名单中
+pub fn is_excluded(path: &str, filename: &str) -> bool {
+    let lower_name = filename.to_lowercase();
+    // 1. 全局排除所有 .lnk 快捷方式
+    if lower_name.ends_with(".lnk") {
+        return true;
+    }
+
+    // 2. 排除 Windows 及 Office Recent 目录
+    let lower_path = path.to_lowercase();
+    if lower_path.contains(r"\appdata\roaming\microsoft\windows\recent")
+        || lower_path.contains(r"\appdata\roaming\microsoft\office\recent")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// 组装注入排除条件的最终 Everything 查询语句
+pub fn build_effective_query(raw_query: &str) -> String {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 注入全局排除规则：排除所有 .lnk 以及 Windows Recent 目录
+    format!(r#"{} !*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*""#, trimmed)
+}
+
 pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return QueryOutput::default();
     }
 
-    let wide_query: Vec<u16> = OsStr::new(trimmed)
+    // 使用带有排除条件的有效查询词
+    let effective_query = build_effective_query(trimmed);
+    let wide_query: Vec<u16> = OsStr::new(&effective_query)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
 
+    // 路径匹配探测：针对用户输入的原始 query 进行判断
     let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
         1
     } else {
@@ -211,7 +243,11 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.clone());
-                    results.push(SearchResult { path, filename });
+
+                    // L2 客户端内存兜底过滤
+                    if !is_excluded(&path, &filename) {
+                        results.push(SearchResult { path, filename });
+                    }
                 }
             }
             return QueryOutput { results, total_matched };
@@ -259,6 +295,32 @@ pub fn execute_ranked_query(
     QueryOutput {
         results: final_results,
         total_matched: raw_output.total_matched,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lnk_and_recent_exclusion() {
+        assert!(is_excluded(r"C:\Users\User\Desktop\test.lnk", "test.lnk"));
+        assert!(is_excluded(r"C:\Users\User\AppData\Roaming\Microsoft\Windows\Recent\doc.docx.lnk", "doc.docx.lnk"));
+        assert!(is_excluded(r"C:\Users\User\AppData\Roaming\Microsoft\Windows\Recent\CustomItem", "CustomItem"));
+        assert!(is_excluded(r"C:\Users\User\AppData\Roaming\Microsoft\Office\Recent\file.docx", "file.docx"));
+
+        // 正常文件不受影响
+        assert!(!is_excluded(r"D:\ZenSearch\README.md", "README.md"));
+        assert!(!is_excluded(r"C:\Program Files\App\app.exe", "app.exe"));
+    }
+
+    #[test]
+    fn test_build_effective_query() {
+        let q = build_effective_query("test");
+        assert_eq!(q, r#"test !*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*""#);
+
+        assert_eq!(build_effective_query(""), "");
+        assert_eq!(build_effective_query("   "), "");
     }
 }
 

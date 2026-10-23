@@ -76,6 +76,19 @@ fn test_noisy_directories_are_penalized() {
 
     let ranked = Ranker::rank(candidates, "index.js", SearchContext::Launcher, &history);
     assert_eq!(ranked[0].path, r"D:\projects\web\src\index.js");
+
+    let recent_candidates = vec![
+        SearchResult {
+            filename: "report.docx".to_string(),
+            path: r"C:\Users\User\AppData\Roaming\Microsoft\Windows\Recent\report.docx".to_string(),
+        },
+        SearchResult {
+            filename: "report.docx".to_string(),
+            path: r"D:\work\report.docx".to_string(),
+        },
+    ];
+    let ranked_recent = Ranker::rank(recent_candidates, "report.docx", SearchContext::Launcher, &history);
+    assert_eq!(ranked_recent[0].path, r"D:\work\report.docx");
 }
 
 #[test]
