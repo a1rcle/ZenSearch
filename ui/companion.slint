@@ -28,6 +28,7 @@ export component CompanionWindow inherits Window {
     }
 
     public function focus_input() {
+        comp_input.clear-focus();
         comp_input.focus();
         comp_input.set-selection-offsets(comp_input.text.character-count, comp_input.text.character-count);
     }
@@ -38,7 +39,6 @@ export component CompanionWindow inherits Window {
         root.selected_index = 0;
         root.scroll_y = 0px;
         comp_input.text = "";
-        comp_input.focus();
     }
 
     title: "ZenSearch_Companion";

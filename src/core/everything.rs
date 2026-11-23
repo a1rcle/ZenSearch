@@ -28,6 +28,7 @@ extern "system" {
     fn Everything_GetTotResults() -> u32;
     fn Everything_GetResultFullPathNameW(nIndex: u32, lpString: *mut u16, nMaxCount: u32) -> u32;
     fn Everything_GetLastError() -> u32;
+    fn Everything_IncRunCountFromFileNameW(lpFileName: *const u16) -> u32;
 }
 
 pub const EVERYTHING_SORT_NAME_ASCENDING: u32 = 1;
@@ -210,24 +211,18 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
         .chain(std::iter::once(0))
         .collect();
 
-    // 路径匹配探测：针对用户输入的原始 query 进行判断
-    let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
-        1
-    } else {
-        0
-    };
-
     unsafe {
-        // Reset query flags to prevent state pollution
+        // Reset query flags to match Everything default behavior:
+        // MatchPath=0 lets Everything natively match paths only for tokens containing '\' or '/'
         Everything_SetMatchCase(0);
         Everything_SetMatchWholeWord(0);
         Everything_SetRegex(0);
-        Everything_SetMatchPath(enable_match_path);
+        Everything_SetMatchPath(0);
 
         Everything_SetSearchW(wide_query.as_ptr());
         Everything_SetRequestFlags(0x00000001 | 0x00000002); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Everything_SetMax(max_results);
-        Everything_SetSort(EVERYTHING_SORT_DATE_MODIFIED_DESCENDING); // 14: Date Modified Descending
+        Everything_SetSort(EVERYTHING_SORT_RUN_COUNT_DESCENDING); // 20: Run Count Descending
 
         if Everything_QueryW(1) != 0 {
             let count = Everything_GetNumResults();
@@ -296,6 +291,33 @@ pub fn execute_ranked_query(
         results: final_results,
         total_matched: raw_output.total_matched,
     }
+}
+
+/// Increments the Everything native run count for the specified file or folder path,
+/// keeping ZenSearch and Everything run-count sorting synchronized.
+pub fn increment_run_count(path: &str) -> u32 {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let wide_path: Vec<u16> = OsStr::new(trimmed)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe { Everything_IncRunCountFromFileNameW(wide_path.as_ptr()) }
+}
+
+/// Executes a broader search specifically for the More full results window,
+/// preserving Everything's native result set and Run Count order while retaining `total_matched`.
+pub fn execute_more_query(query: &str, max_results: u32) -> QueryOutput {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryOutput::default();
+    }
+
+    execute_query(trimmed, max_results)
 }
 
 #[cfg(test)]

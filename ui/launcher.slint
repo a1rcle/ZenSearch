@@ -1,11 +1,7 @@
 import { LineEdit, ListView } from "std-widgets.slint";
-import { Theme } from "common.slint";
+import { Theme, SearchItem } from "common.slint";
 
-export struct SearchItem {
-    filename: string,
-    path: string,
-    icon: image,
-}
+export { SearchItem }
 
 export component LauncherWindow inherits Window {
     in-out property <string> search_text: "";
@@ -17,6 +13,7 @@ export component LauncherWindow inherits Window {
     callback query_changed(string);
     callback item_activated(int);
     callback item_open_folder(int);
+    callback open_more();
     callback dismiss();
 
     public function ensure_selected_visible() {
@@ -32,6 +29,7 @@ export component LauncherWindow inherits Window {
     }
 
     public function focus_input() {
+        search_input.clear-focus();
         search_input.focus();
         search_input.set-selection-offsets(search_input.text.character-count, search_input.text.character-count);
     }
@@ -42,7 +40,6 @@ export component LauncherWindow inherits Window {
         root.selected_index = 0;
         root.scroll_y = 0px;
         search_input.text = "";
-        search_input.focus();
     }
 
     title: "ZenSearch_Launcher";
@@ -137,83 +134,116 @@ export component LauncherWindow inherits Window {
                 }
             }
 
-            // Results List
+            // Results List & More Option
             if root.is_expanded : VerticalLayout {
-                height: min(400px, root.result_items.length * 52px);
-                spacing: 4px;
+                spacing: 6px;
 
-                ListView {
-                    content-y <=> root.scroll_y;
-                    for item[idx] in root.result_items : Rectangle {
-                        height: 50px;
-                        border-radius: 8px;
-                        background: idx == root.selected_index ? Theme.surface-selected : (item_touch.has-hover ? Theme.surface-hover : Theme.surface);
+                if root.result_items.length > 0 : VerticalLayout {
+                    height: min(400px, root.result_items.length * 52px);
+                    spacing: 4px;
 
-                        item_touch := TouchArea {
-                            clicked => {
-                                root.selected_index = idx;
-                                root.item_activated(idx);
-                            }
-                            pointer-event(event) => {
-                                if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                    ListView {
+                        content-y <=> root.scroll_y;
+                        for item[idx] in root.result_items : Rectangle {
+                            height: 50px;
+                            border-radius: 8px;
+                            background: idx == root.selected_index ? Theme.surface-selected : (item_touch.has-hover ? Theme.surface-hover : Theme.surface);
+
+                            item_touch := TouchArea {
+                                clicked => {
                                     root.selected_index = idx;
-                                    root.item_open_folder(idx);
+                                    root.item_activated(idx);
+                                }
+                                pointer-event(event) => {
+                                    if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                        root.selected_index = idx;
+                                        root.item_open_folder(idx);
+                                    }
                                 }
                             }
-                        }
 
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 10px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
 
-                            // File icon pill
-                            Rectangle {
-                                width: 28px;
-                                height: 28px;
-                                y: 5px;
-                                border-radius: 6px;
-                                background: idx == root.selected_index ? #3E4256 : #2D303E;
+                                // File icon pill
+                                Rectangle {
+                                    width: 28px;
+                                    height: 28px;
+                                    y: 5px;
+                                    border-radius: 6px;
+                                    background: idx == root.selected_index ? #3E4256 : #2D303E;
 
-                                Image {
-                                    source: item.icon;
-                                    width: 18px;
-                                    height: 18px;
-                                    image-fit: contain;
-                                    horizontal-alignment: center;
+                                    Image {
+                                        source: item.icon;
+                                        width: 18px;
+                                        height: 18px;
+                                        image-fit: contain;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    horizontal-stretch: 1;
+
+                                    Text {
+                                        text: item.filename;
+                                        font-size: 14px;
+                                        font-weight: 600;
+                                        color: idx == root.selected_index ? Theme.text : #E0E2EC;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: item.path;
+                                        font-size: 11px;
+                                        color: Theme.text-muted;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                if idx == root.selected_index : Text {
+                                    text: "↵ 打开";
+                                    font-size: 11px;
+                                    color: Theme.accent;
                                     vertical-alignment: center;
                                 }
                             }
+                        }
+                    }
+                }
 
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 2px;
-                                horizontal-stretch: 1;
+                // More Option Pill
+                Rectangle {
+                    height: 38px;
+                    border-radius: 8px;
+                    background: more_touch.has-hover ? #383C4F : #252734;
+                    border-width: 1px;
+                    border-color: more_touch.has-hover ? Theme.primary : Theme.border;
 
-                                Text {
-                                    text: item.filename;
-                                    font-size: 14px;
-                                    font-weight: 600;
-                                    color: idx == root.selected_index ? Theme.text : #E0E2EC;
-                                    overflow: elide;
-                                }
+                    more_touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.open_more();
+                        }
+                    }
 
-                                Text {
-                                    text: item.path;
-                                    font-size: 11px;
-                                    color: Theme.text-muted;
-                                    overflow: elide;
-                                }
-                            }
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
 
-                            if idx == root.selected_index : Text {
-                                text: "↵ 打开";
-                                font-size: 11px;
-                                color: Theme.accent;
-                                vertical-alignment: center;
-                            }
+                        Text {
+                            text: "🔍 查看全部匹配结果 (More)...";
+                            font-size: 13px;
+                            font-weight: 500;
+                            color: more_touch.has-hover ? Theme.primary : #B0B5C9;
+                            vertical-alignment: center;
                         }
                     }
                 }

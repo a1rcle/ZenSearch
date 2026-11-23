@@ -81,3 +81,14 @@ fn test_toolwindow_style_calculation() {
     assert_eq!(modified & WS_EX_TOOLWINDOW.0, WS_EX_TOOLWINDOW.0, "Must contain WS_EX_TOOLWINDOW");
     assert_eq!(modified & WS_EX_APPWINDOW.0, 0, "Must NOT contain WS_EX_APPWINDOW");
 }
+
+#[test]
+fn test_more_window_geometry() {
+    scale_manager::init_high_dpi_context();
+    let geom = scale_manager::calculate_more_window_geometry();
+    assert!(geom.width >= 600, "More window width must be at least 600px, got {}", geom.width);
+    assert!(geom.height >= 400, "More window height must be at least 400px, got {}", geom.height);
+    let work = scale_manager::get_focus_screen_work_area();
+    assert!(geom.x >= work.left);
+    assert!(geom.y >= work.top);
+}

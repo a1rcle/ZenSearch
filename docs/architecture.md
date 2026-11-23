@@ -40,16 +40,14 @@ ZenSearch 是一款面向 Windows 平台的高性能桌面启动与搜索增强�
 +---------------------------------------------------------------------------------------+
 |  [ 1. 全局输入与按键中枢 (Input & Hook Hub) ]                                          |
 |       ├── SetWindowsHookExW (WH_KEYBOARD_LL) 零分配无锁钩子                           |
-|       ├── 双击 Ctrl 状态机 (Atomic 时间戳与防误触重置)                                |
+|       ├── 双击 Ctrl 状态机 (KEYUP 完整放行 + Atomic 时间戳与防污染闭环)               |
 |       └── 跨线程无阻塞分发通道 (crossbeam-channel / std::sync::mpsc)                   |
 +---------------------------------------------------------------------------------------+
-|  [ 2. 搜索服务与排序引擎中台 (Search & Ranking Engine) ]                             |
-|       ├── Everything-SDK 原生 FFI 绑定与状态机复位管道                                 |
-|       ├── 宽进精排架构 (Everything 粗排 100~300 条候选 + Rust 纳秒级精排)              |
+|  [ 2. 搜索服务与原生检索中台 (Search Engine) ]                                         |
+|       ├── Everything-SDK 原生 FFI 绑定与状态机复位管道 (MatchPath=0 原生词项匹配语义)  |
+|       ├── 原生直通检索架构 (零重排透传 Everything 结果集与运行次数降序排序)            |
 |       ├── 全局纯净排除与双层拦截 (L1 查询改写 !*.lnk !Recent + L2 内存 is_excluded 过滤)|
-|       ├── 综合多维打分引擎 (全字/前缀/子串/缩写/深度惩罚/脏目录与Recent强力抑制)      |
-|       ├── 自适应使用学习与 Query 记忆绑定 (半衰期指数时间衰减模型)                      |
-|       ├── 场景上下文感知 (Launcher 可执行文件优先 / Companion 目录优先)                |
+|       ├── 运行次数双向同步 (Everything_IncRunCountFromFileNameW 实时回写运行计数)      |
 |       ├── 随包捆绑 Everything 进程守护与静默拉起器 (-startup)                         |
 |       ├── Win32 Shell 原生图标提取与零 I/O 虚拟属性两级常驻缓存 (icon_provider)        |
 |       └── Scoped Search 语法装配器与流式分发管道                                       |
@@ -57,10 +55,11 @@ ZenSearch 是一款面向 Windows 平台的高性能桌面启动与搜索增强�
 |  [ 3. 主搜索浮窗与无状态唤醒中枢 (Slint Global Launcher) ]                             |
 |       ├── 纯浮窗形态与任务栏隐形 (WS_EX_TOOLWINDOW 剥离 WS_EX_APPWINDOW)              |
 |       ├── 失焦即隐机制 (Auto-Dismiss on Unfocus: WM_ACTIVATE WA_INACTIVE)              |
-|       ├── 双击 Ctrl 前台锁穿透与搜索栏原子聚焦 (AttachThreadInput + SetFocus)         |
+|       ├── 双击 Ctrl 前台锁穿透与输入法状态复位 (AttachThreadInput + SetKeyboardState) |
 |       ├── 唤醒即时重置管道 (输入清空 / 候选置空 / 视口归顶 / 未决查询 Token 熔断)      |
 |       ├── 候选列表视口双向绑定与键盘光标滚动跟随 (content-y <=> scroll_y 最小滚动)     |
-|       └── 紧凑单行基准折叠算法与 Slint 声明式动画展开                                  |
+|       ├── 紧凑单行基准折叠算法与 Slint 声明式动画展开                                  |
+|       └── 全量搜索结果窗口协同联动 (More 选项扩展、全盘匹配统计与多维动作分发)          |
 +---------------------------------------------------------------------------------------+
 |  [ 4. 资源管理器随行伴侣 (Explorer Companion) ]                                       |
 |       ├── SetWinEventHook (EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE)       |
@@ -103,6 +102,7 @@ ZenSearch/
 │   └── zensearch.res             # 预编译 Windows 资源二进制
 ├── ui/                           # Slint 声明式界面 DSL
 │   ├── launcher.slint            # 主搜索浮窗界面设计
+│   ├── more_window.slint         # 完整搜索结果窗口设计
 │   ├── companion.slint           # 资源管理器随行条界面设计
 │   ├── main.slint                # 界面导出聚合入口
 │   └── common.slint              # 调色板、圆角与矢量图标组件
@@ -212,9 +212,10 @@ if !single_instance::acquire() {
 | **系统托盘与自启轻量探测** | 注册表首检短路 + 计划任务 TTL 缓存 + `CREATE_NO_WINDOW` | 托盘右键呼出菜单时优先读取注册表并命中内存原子缓存，主线程无子进程阻塞延迟；所有外部命令强制加 `CREATE_NO_WINDOW` 隔离控制台黑框；`TrackPopupMenu` 后追加 `WM_NULL` 保证外部失焦即关。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **浮窗无状态重置 (Clean Slate)** | 唤醒即时重置管道 | 每次唤醒浮窗时强制清空输入框文本、清空候选模型、重置查询 Token、视口与选中索引归零，彻底隔绝前次状态残留。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **轻量浮窗与失焦收起** | `WS_EX_TOOLWINDOW` 与失焦即隐 | 设置 `WS_EX_TOOLWINDOW` 剥离任务栏占位；监听 `WM_ACTIVATE (WA_INACTIVE)` 及 `WM_KILLFOCUS` 实现点击外部区域即时无感隐去。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
-| **双击 Ctrl 焦点穿透** | OS 前台锁穿透与输入框聚焦 | 调用 `AttachThreadInput` + `SetForegroundWindow` + `SetFocus` 穿透前台锁，联动 Slint `invoke_focus_input` 确保光标立即可键入。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
+| **双击 Ctrl 焦点穿透与 IME 纯净隔离** | OS 前台锁穿透与输入法状态复位 | 调用 `AttachThreadInput` + `SetForegroundWindow` 穿透前台锁，联动 `reset_thread_modifier_keys` 清空修饰键状态表与 `SetFocus`，确保光标立即可键入且单键 `Shift` 顺畅切中英文。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **候选列表视口滚动跟随** | `scroll_y` 双向绑定与最小滚动算法 | 顶层 `scroll_y` 属性与 `ListView` 视口 `content-y` 双向绑定；通过 `ensure_selected_visible()` 算法在光标移动时计算最小视口偏移，支持首末项边界驻留。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md)<br>[explorer_companion.md](file:///d:/ZenSearch/docs/features/explorer_companion.md) |
 | **独立窗口安全定位** | 原生命令行直通与路径清洗 | 采用 `CommandExt::raw_arg` 传递原生无转义参数；清洗路径结尾多余反斜杠并保留根目录驱动器标识；加入 `/n` 参数强制开启独立新 Explorer 窗口。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
+| **全量搜索结果窗口 (More Window)** | 快捷入口与独立全量视口联动 | Launcher 下拉列表底部常驻 More 入口，点击展开独立 More 视口；左键执行类型自适应打开（文件调用默认关联程序、目录直接进入 Explorer），右键执行统一父目录定位选中。 | [search_launcher.md](file:///d:/ZenSearch/docs/features/search_launcher.md) |
 | **Windows 11 多标签页适配** | UI Automation 树遍历与 COM 对齐 | 使用 UI Automation 树遍历定位当前激活标签页，并与 `IShellWindows` 实例精确对齐，实现多 Tab 场景下的准确路径提取。 | [path_injection.md](file:///d:/ZenSearch/docs/features/path_injection.md) |
 
 ---

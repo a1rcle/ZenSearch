@@ -206,16 +206,14 @@ pub fn get_explorer_path(target_hwnd: HWND) -> Option<String> {
 
 ### 2. 查询参数装配与引擎调度
 
-提取当前目录物理路径后，拼接 Everything 检索语法并执行毫秒级检索：
+提取当前目录物理路径后，拼接 Everything 检索语法并直通调用原生检索管道（保留全局 `.lnk`/Recent 排除，遵循 `MatchPath=0` 原生词项匹配语义与运行次数降序排序）：
 
 ```rust
 let search_query = format!("path:\"{}\" {}", current_dir, kw);
-let results = crate::core::everything::execute_ranked_query(
-    &search_query,
-    10,
-    crate::core::ranking::SearchContext::Companion,
-);
+let results = crate::core::everything::execute_query(&search_query, 10);
 ```
+
+激活条目或定位所在目录时，同步调用 `core::everything::increment_run_count(&path)` 递增 Everything 运行次数，保持与全局搜索及 Everything 客户端的运行次数排序一致。
 
 ### 3. 候选项独立定位交互规范 (`Ctrl + O` 与鼠标右键)
 

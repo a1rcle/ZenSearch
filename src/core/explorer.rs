@@ -151,6 +151,38 @@ pub fn build_explorer_select_args(path: &str) -> Option<String> {
     Some(format!("/n, /select,\"{}\"", clean_path))
 }
 
+/// Opens a path based on whether it is a directory or a file.
+/// If directory: opens and enters the directory directly in Windows Explorer.
+/// If file: launches/opens the file with the default associated application.
+pub fn open_path(path: &str) {
+    let p = std::path::Path::new(path);
+    if p.is_dir() {
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    } else {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide_path: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+        let wide_open: Vec<u16> = "open\0".encode_utf16().collect();
+        unsafe {
+            let res = ShellExecuteW(
+                None,
+                PCWSTR(wide_open.as_ptr()),
+                PCWSTR(wide_path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+            if (res.0 as usize) <= 32 {
+                let _ = std::process::Command::new("explorer").arg(path).spawn();
+            }
+        }
+    }
+}
+
 /// Opens a new Explorer window locating and selecting the target item (file or folder).
 /// Forces a new independent window (/n) and never reuses existing windows/tabs.
 pub fn open_in_new_explorer_and_select(path: &str) {

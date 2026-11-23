@@ -4,7 +4,12 @@ use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+use windows::Win32::UI::Input::Ime::{ImmAssociateContextEx, HIMC, IACE_DEFAULT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    keybd_event, GetAsyncKeyState, GetFocus, GetKeyboardState, SetActiveWindow, SetFocus,
+    SetKeyboardState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU,
+    VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CallWindowProcW, DefWindowProcW, EnumThreadWindows, FindWindowW,
     GetForegroundWindow, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId,
@@ -147,24 +152,25 @@ pub fn setup_launcher_window(hwnd: HWND, tx: Sender<AppEvent>) {
     set_event_sender(tx);
 
     unsafe {
-        // Apply WS_EX_TOOLWINDOW and strip WS_EX_APPWINDOW (Floating Tool Window Overlay)
-        let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        ex_style = (ex_style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
-
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-
-        // Subclass to intercept WM_ACTIVATE (WA_INACTIVE)
+        // Only apply floating toolwindow styles and subclass once on first setup
         let existing = PREV_WNDPROC.load(Ordering::SeqCst);
         if existing == 0 {
+            // Apply WS_EX_TOOLWINDOW and strip WS_EX_APPWINDOW (Floating Tool Window Overlay)
+            let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            ex_style = (ex_style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
+
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+
+            // Subclass to intercept WM_ACTIVATE (WA_INACTIVE)
             let old_proc = SetWindowLongPtrW(
                 hwnd,
                 GWLP_WNDPROC,
@@ -182,24 +188,25 @@ pub fn setup_companion_window(hwnd: HWND, tx: Sender<AppEvent>) {
     set_event_sender(tx);
 
     unsafe {
-        // Apply WS_EX_TOOLWINDOW and strip WS_EX_APPWINDOW (Floating Tool Window Overlay)
-        let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        ex_style = (ex_style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
-
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-
-        // Subclass to intercept WM_ACTIVATE (WA_INACTIVE)
+        // Only apply floating toolwindow styles and subclass once on first setup
         let existing = PREV_COMPANION_WNDPROC.load(Ordering::SeqCst);
         if existing == 0 {
+            // Apply WS_EX_TOOLWINDOW and strip WS_EX_APPWINDOW (Floating Tool Window Overlay)
+            let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+            ex_style = (ex_style | WS_EX_TOOLWINDOW.0) & !WS_EX_APPWINDOW.0;
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
+
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+
+            // Subclass to intercept WM_ACTIVATE (WA_INACTIVE)
             let old_proc = SetWindowLongPtrW(
                 hwnd,
                 GWLP_WNDPROC,
@@ -321,6 +328,29 @@ pub fn handle_foreground_changed(new_fg: HWND) {
     }
 }
 
+pub unsafe fn reset_thread_modifier_keys() {
+    let mut state = [0u8; 256];
+    if GetKeyboardState(&mut state).is_ok() {
+        state[VK_CONTROL.0 as usize] = 0;
+        state[VK_LCONTROL.0 as usize] = 0;
+        state[VK_RCONTROL.0 as usize] = 0;
+        state[VK_SHIFT.0 as usize] = 0;
+        state[VK_LSHIFT.0 as usize] = 0;
+        state[VK_RSHIFT.0 as usize] = 0;
+        state[VK_MENU.0 as usize] = 0;
+        state[VK_LMENU.0 as usize] = 0;
+        state[VK_RMENU.0 as usize] = 0;
+        let _ = SetKeyboardState(&state);
+    }
+
+    // 仅在系统级异步按键状态确实残留 Ctrl 按下标记时，才补发一次物理级 Ctrl KEYUP，
+    // 避免平时向全局输入队列注入多余的 Ctrl KEYUP 干扰输入法（TSF）的 Shift 切换判定
+    let ctrl_stuck = (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0;
+    if ctrl_stuck {
+        keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
 pub fn force_foreground_and_focus(hwnd: HWND) {
     if hwnd == get_companion_hwnd() {
         record_companion_show_time();
@@ -336,18 +366,64 @@ pub fn force_foreground_and_focus(hwnd: HWND) {
         };
         let cur_thread = GetCurrentThreadId();
 
+        // 1. 仅在跨线程前台穿透阶段短暂绑定输入队列，随后立即解绑
         if fg_thread != 0 && fg_thread != cur_thread {
             let _ = AttachThreadInput(cur_thread, fg_thread, true);
         }
 
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
-        let _ = SetActiveWindow(hwnd);
 
         if fg_thread != 0 && fg_thread != cur_thread {
             let _ = AttachThreadInput(cur_thread, fg_thread, false);
         }
 
+        // 2. 解绑后立即重置当前 UI 线程修饰键状态，防止继承旧前台卡死的 VK_CONTROL 状态干扰输入法
+        reset_thread_modifier_keys();
+
+        // 3. 在最终 SetFocus 之前显式恢复默认 IME 上下文关联，避免 winit 默认禁用态导致 TSF 失步
+        let _ = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
+
+        let _ = SetActiveWindow(hwnd);
+
+        // 4. 若当前焦点已在 hwnd，先清空再重新 SetFocus，确保 Windows TSF/IMM32 收到完整的
+        //    WM_SETFOCUS + WM_IME_SETCONTEXT 激活周期（且发生在 AttachThreadInput 解绑之后）
+        if GetFocus() == hwnd {
+            let _ = SetFocus(HWND::default());
+        }
         let _ = SetFocus(hwnd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reset_thread_modifier_keys() {
+        unsafe {
+            // 模拟键盘状态表中修饰键处于按下状态 (最高位为 1: 0x80)
+            let mut state = [0u8; 256];
+            state[VK_CONTROL.0 as usize] = 0x80;
+            state[VK_LCONTROL.0 as usize] = 0x80;
+            state[VK_RCONTROL.0 as usize] = 0x80;
+            state[VK_SHIFT.0 as usize] = 0x80;
+            state[VK_LSHIFT.0 as usize] = 0x80;
+            state[VK_RSHIFT.0 as usize] = 0x80;
+            let _ = SetKeyboardState(&state);
+
+            // 执行重置
+            reset_thread_modifier_keys();
+
+            // 验证修饰键已被彻底清空
+            let mut after = [0u8; 256];
+            let _ = GetKeyboardState(&mut after);
+            assert_eq!(after[VK_CONTROL.0 as usize], 0);
+            assert_eq!(after[VK_LCONTROL.0 as usize], 0);
+            assert_eq!(after[VK_RCONTROL.0 as usize], 0);
+            assert_eq!(after[VK_SHIFT.0 as usize], 0);
+            assert_eq!(after[VK_LSHIFT.0 as usize], 0);
+            assert_eq!(after[VK_RSHIFT.0 as usize], 0);
+        }
     }
 }

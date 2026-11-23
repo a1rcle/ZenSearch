@@ -3,7 +3,7 @@
 > **文档版本**：v2.0  
 > **更新时间**：2026-10-13  
 > **技术栈选型**：Rust 2021 + Slint UI + Everything-SDK (Rust FFI)  
-> **模块定位**：ZenSearch 的核心搜索入口，包含 Everything 原生 FFI 接入、随包内置守护拉起、无锁低级键盘钩子状态机、主搜索浮窗无状态清空机制以及候选列表键盘光标视口滚动跟随。  
+> **模块定位**：ZenSearch 的核心搜索入口，包含 Everything 原生 FFI 接入、随包内置守护拉起、无锁低级键盘钩子状态机、主搜索浮窗无状态清空机制、候选列表键盘光标视口滚动跟随，以及全量搜索结果窗口（More 窗口）联动与精准动作分发。  
 > **关联架构**：[architecture.md](file:///d:/ZenSearch/docs/architecture.md)
 
 ---
@@ -33,6 +33,7 @@ extern "system" {
     fn Everything_GetTotResults() -> u32;
     fn Everything_GetResultFullPathNameW(nIndex: u32, lpString: *mut u16, nMaxCount: u32) -> u32;
     fn Everything_GetLastError() -> u32;
+    fn Everything_IncRunCountFromFileNameW(lpFileName: *const u16) -> u32;
 }
 
 // Everything 官方标准排序枚举常量
@@ -119,27 +120,21 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
         .chain(std::iter::once(0))
         .collect();
 
-    // 智能全路径匹配判定：针对原始输入判定是否启用全路径比对
-    let enable_match_path = if trimmed.contains(' ') || trimmed.contains('\\') || trimmed.contains('/') {
-        1
-    } else {
-        0
-    };
-
     unsafe {
-        // 1. 状态彻底复位，保障查询独立性
+        // 1. 状态彻底复位，严格对齐 Everything 默认原生匹配语义：
+        // MatchPath=0 时，仅包含 '\' 或 '/' 的词项自动匹配完整路径，其余词项精准匹配文件/目录名
         Everything_SetMatchCase(0);
         Everything_SetMatchWholeWord(0);
         Everything_SetRegex(0);
-        Everything_SetMatchPath(enable_match_path);
+        Everything_SetMatchPath(0);
 
         // 2. 注入有效查询与请求字段
         Everything_SetSearchW(wide_query.as_ptr());
         Everything_SetRequestFlags(0x00000001 | 0x00000002); // EVERYTHING_REQUEST_FILE_NAME | EVERYTHING_REQUEST_PATH
         Everything_SetMax(max_results);
 
-        // 3. 排序策略：修改日期降序（最新优先）
-        Everything_SetSort(EVERYTHING_SORT_DATE_MODIFIED_DESCENDING);
+        // 3. 排序策略：运行次数降序（与 Everything 原生运行次数排序完全一致）
+        Everything_SetSort(EVERYTHING_SORT_RUN_COUNT_DESCENDING);
 
         if Everything_QueryW(1) != 0 {
             let count = Everything_GetNumResults();
@@ -175,113 +170,69 @@ pub fn execute_query(query: &str, max_results: u32) -> QueryOutput {
 }
 ```
 
-### 5. 宽进精排架构与 Listary 级多维排序算法
+### 5. Everything 原生直通检索与运行次数双向同步规范
 
-为提供最契合直觉与肌肉记忆的候选排序，系统采用**宽进精排（Two-Stage Ranking）**架构：底层 Everything 负责毫秒级全盘粗筛，Rust 精排引擎进行多维复合评分与历史加权，输出最优 Top N。
+ZenSearch 在主搜索浮窗（`LauncherWindow`）、完整结果窗口（`MoreWindow`）与资源管理器随行条（`CompanionWindow`）全场景采用**Everything 原生直通检索架构**：在保留全局纯净排除（`*.lnk` 与 `Recent` 目录）的前提下，严格对齐 Everything 原生查询语义、结果集与运行次数排序顺序，不进行破坏原始顺序的二次重排。
 
 ```
 +───────────────────────────────────────────────────────────────────────────────────+
-|                        ZenSearch 宽进精排流水线 (Two-Stage Ranking)                |
+|                 ZenSearch Everything 原生直通检索与运行次数同步流水线               |
 +───────────────────────────────────────────────────────────────────────────────────+
-  用户输入 Query ──► L1: 查询改写注入 (!*.lnk !Recent) ──► Everything SDK 粗排召回 (候选池 100~300 条)
-                                                                 │
-                                                                 ▼
-                                                    L2: 客户端内存兜底过滤 (is_excluded)
-                                │
-                                ▼
-                   ZenSearch 精排计算引擎 (Ranker)
-       ┌────────────────────────┼────────────────────────┐
-       ▼                        ▼                        ▼
-  [ 文本匹配分 S_match ]   [ 自适应历史分 S_history ] [ 场景上下文分 S_type ]
-  • 全字/主干完全匹配       • Query 专属强绑定       • Launcher: 可执行程序优先
-  • 文件名/主干前缀匹配     • 使用频次对数加权        • Companion: 文件夹优先
-  • 连续子串位置加成       • 3天半衰期指数时间衰减               │
-  • 驼峰/首字母缩写匹配                  │                        ▼
-       │                                │             [ 路径惩罚分 S_path ]
-       │                                │             • 目录深度层级递减
-       │                                │             • 噪声目录强制压底
-       └────────────────────────┬───────┴────────────────────────┘
-                                │
-                                ▼
-                     综合总分降序重排 (TotalScore)
-                                │
-                                ▼
-                   截取 Top N 提交 Slint UI 渲染
-                                │
+  用户输入 Query ──► L1: 查询改写注入 (!*.lnk !Recent)
+                              │
+                              ▼
+             Everything SDK 原生索引检索 (零重排直通)
+             • MatchPath=0 / MatchCase=0 / WholeWord=0 / Regex=0
+             • 含 '\' 或 '/' 的词项由 Everything 原生自动匹配路径，普通词项精准匹配名称
+             • Sort = EVERYTHING_SORT_RUN_COUNT_DESCENDING (20: 运行次数降序)
+                              │
+                              ▼
+                 L2: 客户端内存兜底过滤 (is_excluded)
+                              │
+                              ▼
+             按 Everything 原生顺序直接提交 Slint UI 渲染
+             (Launcher Top 50 / More Top 500 / Companion Top 10)
+                              │
                    用户回车激活 / 打开所在目录
-                                │
-                                ▼ (异步持久化)
-                   HistoryManager (%APPDATA%/ZenSearch/history.tsv)
+                              │
+                              ▼ (双向实时同步)
+        Everything_IncRunCountFromFileNameW(&path) (Everything 运行次数 +1)
 ```
 
-#### 1. 评分维度与算法公式
-每个候选结果的最终排序得分由四个维度复合计算：
-$$\text{TotalScore} = S_{\text{match}} + S_{\text{history}} + S_{\text{type}} + S_{\text{path}}$$
+#### 1. 核心检索一致性契约
+* **原生词项路径匹配语义 (`Everything_SetMatchPath(0)`)**：
+  * 全局 `MatchPath` 保持关闭（`0`），与 Everything 默认设置保持一致；
+  * 当用户输入包含路径分隔符的复合查询（如 `bi_cam\ record`）时，Everything 原生仅对含 `\` 的词项（`bi_cam\`）执行路径匹配，而对不含 `\` 的词项（`record`）精准匹配文件或目录名；
+  * 大小写敏感、全字匹配与正则表达式标志均在每次查询前显式复位为 `0`，保障跨次查询完全独立。
+* **原生运行次数降序排序 (`EVERYTHING_SORT_RUN_COUNT_DESCENDING`)**：
+  * 底层固定使用 `EVERYTHING_SORT_RUN_COUNT_DESCENDING (20)` 排序；
+  * 运行次数高的常用目标自然排在最前；运行次数相同时，遵循 Everything 原生次级排序（目录优先、名称升序），与 Everything 客户端返回顺序逐条一致。
+* **零重排直通交付**：
+  * `LauncherWindow` 直接调用 `execute_query(&trimmed, 50)`；
+  * `MoreWindow` 通过 `execute_more_query(&trimmed, 500)` 直通调用 `execute_query(trimmed, 500)`；
+  * `CompanionWindow` 拼接当前目录约束后直接调用 `execute_query(&full_query, 10)`。
 
-* **文本匹配分 ($S_{\text{match}}$，基础核心权重)**：
-  * **完全全字匹配（Exact Match）**：文件名或主干去除扩展名后完全相符，给予最高基础分（`+12,000`）；
-  * **前缀匹配（Prefix Match）**：文件名以搜索词开头（`+6,000`），主干以搜索词开头（`+5,500`）；
-  * **连续子串匹配（Substring Match）**：连续出现在文件名中，并根据命中位置越靠近首部给予递增加成（`+1,000 ~ +3,000`）；
-  * **缩写/首字母匹配（Acronym Match）**：支持单词首字母与 CamelCase 驼峰匹配（如 `vsc` 命中 `Visual Studio Code.exe`，`+4,500`）；
-  * **紧凑度惩罚**：文件名相比搜索词过长时进行微量扣分，保证匹配越紧凑排名越前；
-  * **纯父路径命中惩罚**：若搜索词仅命中父目录而未命中文件名，得分大幅衰减（仅 `+300`）。
-
-* **自适应学习与使用习惯分 ($S_{\text{history}}$，动态演进权重)**：
-  * **Query 记忆绑定（Query-Specific Boost）**：当用户曾输入该特定 Query 并回车启动过某文件时，直接赋予极高专项加成（`+15,000`），达成肌肉记忆秒开；
-  * **总打开频次（Frequency）**：采用对数递增模型 $\log_2(\text{launch\_count} + 1) \times 600$，防止高频项长期永久压制；
-  * **时间新鲜度（Recency 时间半衰期衰减）**：
-    $$\text{Score}_{\text{recency}} = 3000 \times 2^{-\frac{\Delta t}{T_{\text{half}}}}$$
-    其中半衰期设定为 3 天（$T_{\text{half}} = 259,200\text{s}$）。刚访问过的文件获得前列置顶，随着时间推移自然平滑回归基准线。
-
-* **场景上下文与类型分 ($S_{\text{type}}$)**：
-  * **主启动器上下文（`SearchContext::Launcher`）**：`.exe`、`.bat`、`.cmd`、`.appref-ms` 等物理可执行程序获得优先加分（`+2,000`）；（快捷方式 `.lnk` 处于全局排除名单，不参与任何可执行加分）；
-  * **资源管理器随行上下文（`SearchContext::Companion`）**：目录/文件夹获得专属加分（`+2,500`），无缝满足资源管理器穿梭跳转需求。
-
-* **路径深度与噪声目录抑制 ($S_{\text{path}}$)**：
-  * **深度层级惩罚**：路径每多一级目录惩罚 40 分，避免深层无关嵌套项刷屏；
-  * **噪声目录强力打压**：针对 `node_modules`、`.git`、`target\debug`、`target\release`、`AppData\Local\Temp`、`$Recycle.Bin` 以及 `AppData\Roaming\Microsoft\Windows\Recent`、`AppData\Roaming\Microsoft\Office\Recent` 等编译中间件、缓存与历史路径，强行扣除 `6,000` 分沉底。
-
-#### 2. 接口实现规范 (`src/core/everything.rs` & `src/core/ranking/`)
+#### 2. 运行次数双向同步机制 (`increment_run_count`)
+为确保在 ZenSearch 与 Everything 任意一端打开文件或目录都能实时体现在双端排序中，系统通过 Everything-SDK 原生接口双向同步运行计数：
 
 ```rust
-pub fn execute_ranked_query(
-    query: &str,
-    max_results: u32,
-    context: SearchContext,
-) -> QueryOutput {
-    let trimmed = query.trim();
+/// 递增 Everything 原生运行次数，保持 ZenSearch 与 Everything 运行次数排序实时同步
+pub fn increment_run_count(path: &str) -> u32 {
+    let trimmed = path.trim();
     if trimmed.is_empty() {
-        return QueryOutput::default();
+        return 0;
     }
 
-    // 1. 宽进粗排：向 Everything 底层拉取 100~300 条候选池
-    let candidate_pool_size = (max_results * 10).max(100).min(300);
-    let raw_output = execute_query(query, candidate_pool_size);
+    let wide_path: Vec<u16> = OsStr::new(trimmed)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
-    if raw_output.results.is_empty() {
-        return raw_output;
-    }
-
-    // 2. 精排计算：调用 Ranker 综合评分重排
-    let history = HistoryManager::global();
-    let ranked = Ranker::rank(raw_output.results, trimmed, context, &history);
-
-    // 3. 截取 Top N 提交渲染
-    let final_results: Vec<SearchResult> = ranked.into_iter().take(max_results as usize).collect();
-
-    QueryOutput {
-        results: final_results,
-        total_matched: raw_output.total_matched,
-    }
+    unsafe { Everything_IncRunCountFromFileNameW(wide_path.as_ptr()) }
 }
 ```
 
-#### 3. 用户交互正向反馈机制
-* 当用户在浮窗中按下回车激活项（`on_item_activated`）或右键直接定位所在目录（`on_item_open_folder`）时，自动触发：
-  ```rust
-  core::ranking::HistoryManager::global().record_launch(&query, &path);
-  ```
-* 记录原子化更新至单例状态，并实时异步持久化至用户目录 `%APPDATA%\ZenSearch\history.tsv`，保证下次同类查询立即可用。
+* 当用户在 `LauncherWindow`、`MoreWindow` 或 `CompanionWindow` 中执行打开目标（`on_item_activated`）或定位所在目录（`on_item_open_folder`）时，立即调用 `core::everything::increment_run_count(&path)`，将操作行为实时写入 Everything 运行历史数据库。
 
 
 ---
@@ -342,49 +293,77 @@ ZenSearch 将绿色版 `Everything.exe` 内置于 `tools/` 目录，构建环境
 Windows 操作系统通过 `LowLevelHooksTimeout` 严格限制钩子执行时延。键盘钩子回调遵循**零堆分配、无阻塞、无锁**原则：
 
 ```rust
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, KBDLLHOOKSTRUCT, VK_LCONTROL, VK_RCONTROL, WM_KEYDOWN,
+    CallNextHookEx, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-static LAST_CTRL_PRESS_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_CTRL_UP_MS: AtomicI64 = AtomicI64::new(0);
+static CTRL_TAINTED: AtomicBool = AtomicBool::new(false);
 
 pub unsafe extern "system" fn low_level_keyboard_proc(
     n_code: i32,
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    if n_code >= 0 && w_param.0 as u32 == WM_KEYDOWN {
+    // 1. KEYDOWN 阶段：维护干净按键状态
+    if n_code >= 0 && (w_param.0 as u32 == WM_KEYDOWN || w_param.0 as u32 == WM_SYSKEYDOWN) {
         let kbd = *(l_param.0 as *const KBDLLHOOKSTRUCT);
         let vk = kbd.vkCode as u16;
 
-        if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            
-            let prev = LAST_CTRL_PRESS_MS.swap(now, Ordering::Relaxed);
-            let diff = now - prev;
-
-            // 双击 Ctrl 命中区间: 50ms ~ 350ms
-            if diff > 50 && diff < 350 {
-                LAST_CTRL_PRESS_MS.store(0, Ordering::Relaxed);
-                // 向 UI 线程发送无阻塞唤醒信号
-                crate::EVENT_CHANNEL.0.try_send(crate::AppEvent::ToggleLauncher).ok();
-                // 消费该按键，防止向其他窗口继续传递
-                return LRESULT(1);
-            }
+        if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
+            // Ctrl 按下：标记当前按键周期为干净（尚未与其他键组合）
+            CTRL_TAINTED.store(false, Ordering::Relaxed);
         } else {
-            // 夹杂了其他非 Ctrl 按键（如 Ctrl+C、Ctrl+Tab），立即重置双击等待
-            LAST_CTRL_PRESS_MS.store(0, Ordering::Relaxed);
+            // 夹杂非 Ctrl 按键（如 Ctrl+C、Ctrl+Tab）：污染当前按键周期并清空前次记录
+            CTRL_TAINTED.store(true, Ordering::Relaxed);
+            LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
         }
     }
 
+    // 2. KEYUP 阶段：在第二次干净释放时触发唤醒
+    if n_code >= 0 && (w_param.0 as u32 == WM_KEYUP || w_param.0 as u32 == WM_SYSKEYUP) {
+        let kbd = *(l_param.0 as *const KBDLLHOOKSTRUCT);
+        let vk = kbd.vkCode as u16;
+
+        if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
+            if !CTRL_TAINTED.load(Ordering::Relaxed) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let prev = LAST_CTRL_UP_MS.swap(now, Ordering::Relaxed);
+                let diff = now - prev;
+
+                // 双击 Ctrl 命中区间: 50ms ~ 400ms
+                if diff > 50 && diff < 400 {
+                    LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
+                    CTRL_TAINTED.store(true, Ordering::Relaxed);
+                    // 向 UI 线程发送无阻塞唤醒信号
+                    if let Ok(lock) = EVENT_SENDER.lock() {
+                        if let Some(tx) = lock.as_ref() {
+                            let _ = tx.try_send(AppEvent::ToggleLauncher);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 全量事件正常放行，严禁吞噬，保持系统级按键生命周期与输入法状态机完整
     CallNextHookEx(None, n_code, w_param, l_param)
 }
 ```
+
+### 2. 双击 Ctrl 状态机与按键生命周期规范
+* **完整生命周期放行原则（Natural Event Flow）**：所有按键的 `WM_KEYDOWN` 与 `WM_KEYUP` 均由 `CallNextHookEx` 全量放行，绝不使用 `return LRESULT(1)` 截断。该机制保证当前前台应用与输入法（IME）获取到配对完备的击键生命周期；
+* **防污染状态机（Tainted Isolation Guard）**：通过原子布尔量 `CTRL_TAINTED` 与释放时间戳 `LAST_CTRL_UP_MS` 协同工作，彻底隔绝 `Ctrl + C`、`Ctrl + V`、`Ctrl + Shift` 等组合键的误唤醒；
+* **修饰键全集完整覆盖**：在全局键盘过滤与资源管理器前台判定中，修饰键严格覆盖 `VK_LCONTROL`、`VK_RCONTROL`、`VK_LMENU`、`VK_RMENU`、`VK_LWIN`、`VK_RWIN`、`VK_SHIFT`、`VK_LSHIFT`、`VK_RSHIFT` 全集合。
 
 ---
 
@@ -410,18 +389,18 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
 
 ---
 
-### 3. 双击 Ctrl 穿透前台锁与输入框原子聚焦 (Direct Focus Pipeline)
+### 3. 双击 Ctrl 穿透前台锁与输入法纯净状态复位 (Direct Focus Pipeline & IME State Reset)
 > [!IMPORTANT]
-> **前台锁穿透（Foreground Lockout Bypass）**：Windows 操作系统具备严格的前台焦点限制保护。ZenSearch 采用跨进程输入挂载与激活管道，确保浮窗呼出瞬间系统键盘焦点 100% 直达搜索输入框，杜绝丢字与光标失焦。
+> **前台锁穿透与输入法无干扰环境构建（Direct Focus & IME Isolation）**：Windows 操作系统具备严格的前台焦点限制保护，且跨线程激活极易引发修饰键逻辑状态滞留。ZenSearch 采用跨进程输入挂载、线程按键状态表强行复位与原子级聚焦管道，确保浮窗呼出瞬间系统键盘焦点 100% 直达搜索输入框，同时切断任何修饰键粘滞，确保单键 Shift 顺畅切换中英文模式。
 
 ```
 +─────────────────────────────────────────────────────────────────────────────+
-|           双击 Ctrl 跨进程前台锁穿透与搜索栏直达焦点时序 (Direct Focus Pipeline)     |
+|     双击 Ctrl 跨进程前台锁穿透与输入法状态复位时序 (Direct Focus Pipeline)     |
 +─────────────────────────────────────────────────────────────────────────────+
-                            用户双击 Ctrl 击键
+                            用户双击 Ctrl 干净释放
                                      │
                                      ▼
-                     [ 低级键盘钩子状态机命中 ] (50ms~350ms)
+                     [ 低级键盘钩子状态机命中 ] (50ms~400ms)
                                      │
                                      ▼
                   [ 1. 抓取当前宿主与前台线程 ID ]
@@ -443,11 +422,16 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
                   AttachThreadInput(cur_thread, fg_thread, false)
                                      │
                                      ▼
-                  [ 5. Win32 级别系统键盘焦点交割 ]
+                  [ 5. UI 线程修饰键状态表纯净重置 (IME 隔离) ]
+                   reset_thread_modifier_keys()
+                   SetKeyboardState([0; 256]) & keybd_event(VK_CONTROL, KEYUP)
+                                      │
+                                      ▼
+                   [ 6. Win32 级别系统键盘焦点交割 ]
                   SetFocus(launcher_hwnd)
                                      │
                                      ▼
-                  [ 6. Slint 内部搜索输入栏光标聚焦 ]
+                  [ 7. Slint 内部搜索输入栏光标聚焦 ]
                   ui.invoke_focus_input() -> search_input.focus()
 ```
 
@@ -501,11 +485,11 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
                                             scale_manager::center_on_focus_screen()
                                                       │
                                                       ▼
-                                            [ 步骤 7: 跨进程前台锁穿透置顶 ]
-                                            AttachThreadInput + SetForegroundWindow
+                                            [ 步骤 7: 跨进程前台锁穿透与修饰键纯净重置 ]
+                                            AttachThreadInput + SetForegroundWindow + reset_thread_modifier_keys()
                                                       │
                                                       ▼
-                                            [ 步骤 8: 原子级光标聚焦搜索栏 ]
+                                            [ 步骤 8: 原子级光标聚焦搜索栏与输入法绑定 ]
                                             SetFocus + ui.invoke_focus_input()
 ```
 
@@ -815,3 +799,81 @@ Rectangle {
     }
 }
 ```
+
+---
+
+## 七、 完整搜索结果窗口 (More 窗口) 与全量浏览规范
+
+### 1. 架构定位与双层视口设计 (Two-tier View Architecture)
+ZenSearch 全局搜索采用“快捷浮窗 + 深度全量窗口”的双层视口架构设计：
+* **第一层：主搜索浮窗 (`LauncherWindow`)**：双击 `Ctrl` 毫秒级唤醒，按 Everything 原生运行次数排序直通展示前 50 项候选，保障即搜即走的轻量体验；
+* **第二层：完整搜索结果窗口 (`MoreWindow`)**：当用户需要在更宽广的视口中浏览检索词匹配的所有项目时，通过下拉列表中配置的 `More` 入口一键展开独立窗口，提供全量项目展示、完整路径查看与多维动作分发。
+
+```
++-----------------------------------------------------------------------------------+
+|                        [双击 Ctrl 唤醒全局主搜索浮窗]                              |
+|                          ZenSearch LauncherWindow                                 |
+|   [ 🔍 输入关键词 (实时显示 Everything 原生排序 Top 50 候选)                      ] |
+|   ├── Item 1 (运行次数优先第一项)                                                 |
+|   ├── Item 2 ...                                                                  |
+|   └── [ 🔍 查看全部匹配结果 (More)... ]  <────────── 用户点击展开全量视口           |
++-----------------------------------------------------------------------------------+
+                                      │
+                                      ▼ Launcher 隐藏并平滑过渡
++-----------------------------------------------------------------------------------+
+|                     [完整搜索结果窗口] ZenSearch MoreWindow                         |
+|  [ 🔍 继承/编辑检索词 ]                                       [ 匹配 1,520 项 ]    |
+|  -------------------------------------------------------------------------------  |
+|   📄 document.docx    D:\Workspace\Projects\document.docx                    ↵ 打开 |
+|   📁 source_code      D:\ZenSearch\src\core                                  ↵ 打开 |
+|   ... (全量匹配项目列表，全部左对齐流式排版，支持平滑滚动与键盘导航)                 |
+|  -------------------------------------------------------------------------------  |
+|  💡 操作提示: 鼠标左键：打开文件 / 进入目录 | 鼠标右键：打开所在文件夹 | Esc：关闭窗口    |
++-----------------------------------------------------------------------------------+
+```
+
+### 2. 触发入口与视口联动机制
+* **常驻入口规范**：在 Launcher 下拉列表展开期间，候选列表底部常驻渲染 `🔍 查看全部匹配结果 (More)...` 选项卡，具备鼠标悬停色彩反馈与指针手型引导；
+* **搜索词无缝传递**：点击 More 选项时，Launcher 触发 `open_more()` 回调并执行自隐，同时提取当前输入框文本无损注入 `MoreWindow` 的 `search_text` 属性，即刻触发全量检索；
+* **动态重检支持**：`MoreWindow` 顶部内嵌全功能输入框，用户可直接在窗口内追加条件或更换关键词，即时更新全量检索结果；
+* **窗口生命周期管理**：
+  * 支持 `Esc` 键快速退出并隐藏；
+  * 支持标题栏关闭按钮（`on_close_requested` 配置 `HideWindow` 模式，保持进程常驻无额外重建开销）。
+
+### 3. 结果列表排版与对齐规范 (Result List Layout Specification)
+为确保全量搜索结果在宽屏及多分辨率视口下的视觉清晰度与高信息密度，`MoreWindow` 的结果列表项遵循以下排版契约：
+* **单行水平流式与全局左对齐**：每个结果项采用单行水平排布，文件图标、文件名和完整路径均以左侧为基准线自然排列。
+* **文件名自适应与间距控制**：
+  * **自然宽度展开**：文件名文本根据其实际字符长度自适应展开；
+  * **适量留空规范**：文件名与路径之间设定为固定的 `12px` 适量间隔（`spacing: 12px`），确保路径紧随文件名后起始展示；
+  * **长文件名截断保护**：为文件名设定 `max-width: 300px` 配合 `overflow: elide`，超长名称自动在末尾省略，防止压缩路径的可用可视区域。
+* **路径全宽延伸展示**：路径配置 `horizontal-stretch: 1` 占满剩余视口宽度，并配置 `overflow: elide`，最大化呈现深层目录结构。
+* **动态操作指示**：行尾的 `↵ 打开` 操作标签仅在当前条目处于选中（高亮）状态时展示在右侧，非选中状态隐藏，保持整洁开阔的视觉效果。
+* **沉浸式无表头视口**：列表视口不设固定的分列表头，结合顶部检索栏的统计胶囊（如 `匹配 N 项`）与底部操作指引栏，将全部垂直空间提供给结果列表滚动呈现。
+
+### 4. 项目项操作与精准动作分发规范 (Action Dispatch)
+在完整结果列表中，支持对文件与目录进行差异化的交互响应：
+
+| 触发操作 | 目标类型为「普通文件」 | 目标类型为「目录 / 文件夹」 | 底层实现与 API |
+| :--- | :--- | :--- | :--- |
+| **鼠标左键单击** / **回车键** | **直接打开该文件**：调用系统默认关联程序启动（如 `.pdf` 打开阅读器，`.docx` 打开 Word） | **直接进入该目录**：在 Windows 文件资源管理器（Explorer）中打开并浏览该目录 | `core::explorer::open_path(&path)`：基于 `Path::is_dir()` 判定，文件调用 `ShellExecuteW("open")`，目录调用 `Command::new("explorer").arg(path)` |
+| **鼠标右键单击** | **打开所在文件夹并定位**：在 Windows 资源管理器中打开目标所在父目录，并高亮选中该文件 | **打开所在文件夹并定位**：在 Windows 资源管理器中打开该目录所在父目录，并高亮选中该文件夹 | `core::explorer::open_in_new_explorer_and_select(&path)`：基于 `/n, /select,"<path>"` 原生命令行直通 |
+
+### 5. 数据层检索与流控性能保护
+针对磁盘海量匹配场景（如检索单字母可能匹配数万文件），数据层实施保护性流控：
+* **全量统计契约 (`execute_more_query`)**：
+  * 调用 Everything C FFI 获取底层索引库真实命中总数 `total_matched = Everything_GetTotResults()`；
+  * 直通透传 Everything 原生结果集与运行次数降序排列，保证与 Everything 主界面顺序一致；
+* **内存与渲染流控**：
+  * 向 Slint UI 层提交 500 项安全上限，避免瞬时构建过量 UI 节点导致主线程顿卡；
+  * 状态栏与顶部徽标向用户明确展示统计指标（如 `显示前 500 项（共匹配 3,820 项）`）；
+* **零 I/O 虚拟属性图标提取**：
+  * 全量条目无缝复用 `core::icon_provider` 两级常驻缓存，图标加载耗时 $\le 50\text{ns}$，确保长列表百项滚动丝滑达 60FPS。
+
+### 6. 多显示器与高 DPI 自适应几何推导
+`MoreWindow` 严格遵循系统的 Per-Monitor V2 高 DPI 几何规范：
+* **基准逻辑尺寸**：定义基准逻辑宽度 $900\text{px}$、逻辑高度 $620\text{px}$；
+* **动态居中算法 (`core::scale_manager::calculate_more_window_geometry`)**：
+  * 探测用户当前操作光标所在显示器的 `rcWork` 工作区尺寸；
+  * 结合屏幕 DPI 缩放因子计算物理像素尺寸；
+  * 采用屏幕中心偏移计算，确保在任意分辨率（1080P / 2K / 4K）及不同系统缩放比例（100% ~ 250%）下均精准居中展现。

@@ -80,9 +80,11 @@ fn main() {
     // 7. Initialize Slint GUI Windows
     let launcher = LauncherWindow::new().expect("Failed to create LauncherWindow");
     let companion = CompanionWindow::new().expect("Failed to create CompanionWindow");
+    let more_window = MoreWindow::new().expect("Failed to create MoreWindow");
 
     let is_launcher_visible = Arc::new(AtomicBool::new(false));
     let is_companion_visible = Arc::new(AtomicBool::new(false));
+    let is_more_visible = Arc::new(AtomicBool::new(false));
 
     // Setup Launcher Callbacks
     {
@@ -96,7 +98,7 @@ fn main() {
                     let metrics = core::scale_manager::calculate_launcher_geometry(false, 0);
                     ui.window().set_size(slint::PhysicalSize::new(metrics.width as u32, metrics.height as u32));
                 } else {
-                    let results = core::everything::execute_ranked_query(&trimmed, 50, core::ranking::SearchContext::Launcher);
+                    let results = core::everything::execute_query(&trimmed, 50);
                     let slint_items: Vec<SearchItem> = results
                         .iter()
                         .map(|r| SearchItem {
@@ -107,8 +109,8 @@ fn main() {
                         .collect();
                     let count = slint_items.len();
                     ui.set_result_items(ModelRc::new(VecModel::from(slint_items)));
-                    ui.set_is_expanded(count > 0);
-                    let metrics = core::scale_manager::calculate_launcher_geometry(count > 0, count);
+                    ui.set_is_expanded(true);
+                    let metrics = core::scale_manager::calculate_launcher_geometry(true, count);
                     ui.window().set_size(slint::PhysicalSize::new(metrics.width as u32, metrics.height as u32));
                 }
             }
@@ -135,8 +137,9 @@ fn main() {
                 let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
                     core::ranking::HistoryManager::global().record_launch(&query, &path);
-                    let _ = std::process::Command::new("explorer").arg(&path).spawn();
+                    core::explorer::open_path(&path);
                 }
                 ui.hide().ok();
                 visible_flag.store(false, Ordering::SeqCst);
@@ -153,12 +156,156 @@ fn main() {
                 let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
                     core::ranking::HistoryManager::global().record_launch(&query, &path);
                     core::explorer::open_in_new_explorer_and_select(&path);
                 }
                 ui.hide().ok();
                 visible_flag.store(false, Ordering::SeqCst);
             }
+        });
+    }
+
+    {
+        let launcher_weak = launcher.as_weak();
+        let more_weak = more_window.as_weak();
+        let launcher_vis = is_launcher_visible.clone();
+        let more_vis = is_more_visible.clone();
+        launcher.on_open_more(move || {
+            if let Some(launcher_ui) = launcher_weak.upgrade() {
+                let query = launcher_ui.get_search_text().to_string();
+                let trimmed = query.trim().to_string();
+                launcher_ui.hide().ok();
+                launcher_vis.store(false, Ordering::SeqCst);
+
+                if let Some(more_ui) = more_weak.upgrade() {
+                    more_ui.set_search_text(trimmed.clone().into());
+                    let output = if trimmed.is_empty() {
+                        core::everything::QueryOutput::default()
+                    } else {
+                        core::everything::execute_more_query(&trimmed, 500)
+                    };
+                    let count = output.results.len();
+                    let total = output.total_matched;
+                    let slint_items: Vec<SearchItem> = output
+                        .results
+                        .iter()
+                        .map(|r| SearchItem {
+                            filename: r.filename.clone().into(),
+                            path: r.path.clone().into(),
+                            icon: core::icon_provider::get_icon_for_path(&r.path),
+                        })
+                        .collect();
+                    more_ui.set_result_items(ModelRc::new(VecModel::from(slint_items)));
+                    more_ui.set_total_count(total as i32);
+                    let status_text = if (total as usize) > count {
+                        format!("显示前 {} 项（共匹配 {} 项）| [左键] 打开文件/进入目录 | [右键] 打开所在文件夹", count, total)
+                    } else {
+                        format!("共匹配 {} 项 | [左键] 打开文件/进入目录 | [右键] 打开所在文件夹", total)
+                    };
+                    more_ui.set_status_text(status_text.into());
+
+                    let metrics = core::scale_manager::calculate_more_window_geometry();
+                    more_ui.window().set_position(slint::PhysicalPosition::new(metrics.x, metrics.y));
+                    more_ui.window().set_size(slint::PhysicalSize::new(metrics.width as u32, metrics.height as u32));
+                    more_ui.show().ok();
+                    more_vis.store(true, Ordering::SeqCst);
+                    more_ui.invoke_focus_input();
+                }
+            }
+        });
+    }
+
+    // Setup More Window Callbacks
+    {
+        let more_weak = more_window.as_weak();
+        more_window.on_query_changed(move |query| {
+            if let Some(ui) = more_weak.upgrade() {
+                let trimmed = query.trim().to_string();
+                if trimmed.is_empty() {
+                    ui.set_result_items(ModelRc::new(VecModel::default()));
+                    ui.set_total_count(0);
+                    ui.set_status_text("".into());
+                } else {
+                    let output = core::everything::execute_more_query(&trimmed, 500);
+                    let count = output.results.len();
+                    let total = output.total_matched;
+                    let slint_items: Vec<SearchItem> = output
+                        .results
+                        .iter()
+                        .map(|r| SearchItem {
+                            filename: r.filename.clone().into(),
+                            path: r.path.clone().into(),
+                            icon: core::icon_provider::get_icon_for_path(&r.path),
+                        })
+                        .collect();
+                    ui.set_result_items(ModelRc::new(VecModel::from(slint_items)));
+                    ui.set_total_count(total as i32);
+                    let status_text = if (total as usize) > count {
+                        format!("显示前 {} 项（共匹配 {} 项）| [左键] 打开文件/进入目录 | [右键] 打开所在文件夹", count, total)
+                    } else {
+                        format!("共匹配 {} 项 | [左键] 打开文件/进入目录 | [右键] 打开所在文件夹", total)
+                    };
+                    ui.set_status_text(status_text.into());
+                }
+            }
+        });
+    }
+
+    {
+        let more_weak = more_window.as_weak();
+        let visible_flag = is_more_visible.clone();
+        more_window.on_dismiss(move || {
+            if let Some(ui) = more_weak.upgrade() {
+                ui.hide().ok();
+                visible_flag.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    {
+        let more_weak = more_window.as_weak();
+        let visible_flag = is_more_visible.clone();
+        more_window.on_item_activated(move |idx| {
+            if let Some(ui) = more_weak.upgrade() {
+                let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
+                if let Some(item) = items.row_data(idx as usize) {
+                    let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
+                    core::explorer::open_path(&path);
+                }
+                ui.hide().ok();
+                visible_flag.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    {
+        let more_weak = more_window.as_weak();
+        let visible_flag = is_more_visible.clone();
+        more_window.on_item_open_folder(move |idx| {
+            if let Some(ui) = more_weak.upgrade() {
+                let items = ui.get_result_items();
+                let query = ui.get_search_text().to_string();
+                if let Some(item) = items.row_data(idx as usize) {
+                    let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
+                    core::ranking::HistoryManager::global().record_launch(&query, &path);
+                    core::explorer::open_in_new_explorer_and_select(&path);
+                }
+                ui.hide().ok();
+                visible_flag.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    {
+        let visible_flag = is_more_visible.clone();
+        more_window.window().on_close_requested(move || {
+            visible_flag.store(false, Ordering::SeqCst);
+            slint::CloseRequestResponse::HideWindow
         });
     }
 
@@ -192,7 +339,7 @@ fn main() {
                     } else {
                         trimmed
                     };
-                    let results = core::everything::execute_ranked_query(&full_query, 10, core::ranking::SearchContext::Companion);
+                    let results = core::everything::execute_query(&full_query, 10);
                     let slint_items: Vec<SearchItem> = results
                         .iter()
                         .map(|r| SearchItem {
@@ -237,6 +384,7 @@ fn main() {
                 let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
                     core::ranking::HistoryManager::global().record_launch(&query, &path);
                     let _ = std::process::Command::new("explorer").arg(&path).spawn();
                 }
@@ -258,6 +406,7 @@ fn main() {
                 let query = ui.get_search_text().to_string();
                 if let Some(item) = items.row_data(idx as usize) {
                     let path = item.path.to_string();
+                    core::everything::increment_run_count(&path);
                     core::ranking::HistoryManager::global().record_launch(&query, &path);
                     core::explorer::open_in_new_explorer_and_select(&path);
                 }
@@ -323,6 +472,17 @@ fn main() {
 
                             // Immediately focus on search bar input
                             ui.invoke_focus_input();
+
+                            // Schedule a next-tick focus/IME confirmation after winit drains buffered Focused(true)
+                            let ui_next = launcher_weak.clone();
+                            let vis_next = vis_flag.clone();
+                            slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                                if vis_next.load(Ordering::SeqCst) {
+                                    if let Some(ui) = ui_next.upgrade() {
+                                        ui.invoke_focus_input();
+                                    }
+                                }
+                            });
                         }
                     });
                 }
@@ -416,6 +576,16 @@ fn main() {
                             }
 
                             ui.invoke_focus_input();
+
+                            let ui_next = comp_weak.clone();
+                            let vis_next = vis_flag.clone();
+                            slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                                if vis_next.load(Ordering::SeqCst) {
+                                    if let Some(ui) = ui_next.upgrade() {
+                                        ui.invoke_focus_input();
+                                    }
+                                }
+                            });
                         }
                     });
                 }

@@ -127,7 +127,7 @@ cargo run -- --diagnose-watch
 
 | 异常现象 | 可能诱因 | 推荐排查与解决步骤 |
 | :--- | :--- | :--- |
-| **双击 Ctrl 全局搜索框不弹出** | 1. 两次按键间隔不在 50~350ms 之间<br>2. 夹杂了其他非 Ctrl 按键<br>3. 进程未能挂载至活动交互桌面 | 运行 `zensearch.exe --diagnose-watch` 观察控制台输出的毫秒差与状态转移日志，调整按键习惯或检查是否有全局键位拦截软件冲突。 |
+| **双击 Ctrl 全局搜索框不弹出** | 1. 两次按键间隔不在 50~400ms 之间<br>2. 夹杂了其他非 Ctrl 按键<br>3. 进程未能挂载至活动交互桌面 | 运行 `zensearch.exe --diagnose-watch` 观察控制台输出的毫秒差与状态转移日志，调整按键习惯或检查是否有全局键位拦截软件冲突。 |
 | **搜索框输入后无任何结果** | 1. Everything 未在用户会话运行<br>2. 随包版未被成功拉起 | 运行 `zensearch.exe --diagnose` 检查第二项。确保后台存在 `Everything.exe` 进程。 |
 | **另存为对话框无法注入路径** | 1. 对话框宿主软件以管理员权限运行（受 UIPI 拦截）<br>2. 非标准 Common Dialog | 检查是否通过 Inno Setup 正式安装；确认计划任务特权自启是否生效。若以普通权限启动，尝试右键“以管理员身份运行”ZenSearch 验证。 |
 | **只能点击对话框下方部分触发跳转，点击空白处或导航栏无法跳转** | 1. `EVENT_SYSTEM_FOREGROUND` 在鼠标按下（`WM_LBUTTONDOWN`）瞬间触发，子控件尚未完成点击结算<br>2. 点击空白处（`DirectUIHWND`）或导航栏（`SysTreeView32` / `ToolbarWindow32`）抢走键盘焦点，导致 `comdlg32.dll` 将 `VK_RETURN` 路由给视图并忽略 `Edit` 控件 | 确保 `inject_path_to_dialog` 执行 `wait_for_mouse_release()` 等待物理鼠标释放，并通过 `AttachThreadInput` + `SetFocus(edit_hwnd)` 强制锁定文件名编辑框焦点及地址栏回环重试。运行 `cargo test --test test_path_injection` 验证 `test_live_dialog_blank_and_navbar_focus_injection` 通过。 |

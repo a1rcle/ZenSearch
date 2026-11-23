@@ -4,13 +4,14 @@ use std::sync::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE,
-    VK_F1, VK_F12, VK_F2, VK_F5, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LWIN, VK_RCONTROL,
-    VK_RETURN, VK_RIGHT, VK_RMENU, VK_RWIN, VK_SPACE, VK_TAB, VK_UP,
+    VK_F1, VK_F12, VK_F2, VK_F5, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+    VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW,
     PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 #[derive(Debug, Clone)]
@@ -23,7 +24,8 @@ pub enum AppEvent {
     DiagnoseKeyPress { delta_ms: i64, is_double_ctrl: bool, vk: u16 },
 }
 
-static LAST_CTRL_PRESS_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_CTRL_UP_MS: AtomicI64 = AtomicI64::new(0);
+static CTRL_TAINTED: AtomicBool = AtomicBool::new(false);
 static EVENT_SENDER: Mutex<Option<Sender<AppEvent>>> = Mutex::new(None);
 static HOOK_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -38,41 +40,14 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
         let kbd = *(l_param.0 as *const KBDLLHOOKSTRUCT);
         let vk = kbd.vkCode as u16;
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        // 1. Double-click Ctrl Detection
+        // 1. Double-click Ctrl Detection (KEYDOWN: maintain tainted state only)
         if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
-            let prev = LAST_CTRL_PRESS_MS.swap(now, Ordering::Relaxed);
-            let diff = now - prev;
-
-            let is_hit = diff > 50 && diff < 350;
-            if WATCH_MODE.load(Ordering::Relaxed) {
-                if let Ok(lock) = EVENT_SENDER.lock() {
-                    if let Some(tx) = lock.as_ref() {
-                        let _ = tx.try_send(AppEvent::DiagnoseKeyPress {
-                            delta_ms: diff,
-                            is_double_ctrl: is_hit,
-                            vk,
-                        });
-                    }
-                }
-            }
-
-            if is_hit {
-                LAST_CTRL_PRESS_MS.store(0, Ordering::Relaxed);
-                if let Ok(lock) = EVENT_SENDER.lock() {
-                    if let Some(tx) = lock.as_ref() {
-                        let _ = tx.try_send(AppEvent::ToggleLauncher);
-                    }
-                }
-                return LRESULT(1);
-            }
+            // Ctrl 按下：标记当前按压为"干净"（尚未与其他键组合）
+            CTRL_TAINTED.store(false, Ordering::Relaxed);
         } else {
-            // Any other key resets double Ctrl timer
-            LAST_CTRL_PRESS_MS.store(0, Ordering::Relaxed);
+            // 非 Ctrl 键按下：污染当前 Ctrl 按压，并清除上次记录
+            CTRL_TAINTED.store(true, Ordering::Relaxed);
+            LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
         }
 
         // 2. Ctrl + G Manual Injection in #32770 dialog
@@ -108,7 +83,10 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
                         || vk == VK_LMENU.0
                         || vk == VK_RMENU.0
                         || vk == VK_LWIN.0
-                        || vk == VK_RWIN.0;
+                        || vk == VK_RWIN.0
+                        || vk == VK_SHIFT.0
+                        || vk == VK_LSHIFT.0
+                        || vk == VK_RSHIFT.0;
 
                     let is_control_key = vk == VK_RETURN.0
                         || vk == VK_ESCAPE.0
@@ -154,6 +132,47 @@ pub unsafe extern "system" fn low_level_keyboard_proc(
                             }
                         }
                     }
+            }
+        }
+    }
+
+    // ── Double-click Ctrl: trigger on second clean KEYUP ──
+    if n_code >= 0 && (w_param.0 as u32 == WM_KEYUP || w_param.0 as u32 == WM_SYSKEYUP) {
+        let kbd = *(l_param.0 as *const KBDLLHOOKSTRUCT);
+        let vk = kbd.vkCode as u16;
+
+        if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
+            if !CTRL_TAINTED.load(Ordering::Relaxed) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let prev = LAST_CTRL_UP_MS.swap(now, Ordering::Relaxed);
+                let diff = now - prev;
+
+                let is_hit = diff > 50 && diff < 400;
+                if WATCH_MODE.load(Ordering::Relaxed) {
+                    if let Ok(lock) = EVENT_SENDER.lock() {
+                        if let Some(tx) = lock.as_ref() {
+                            let _ = tx.try_send(AppEvent::DiagnoseKeyPress {
+                                delta_ms: diff,
+                                is_double_ctrl: is_hit,
+                                vk,
+                            });
+                        }
+                    }
+                }
+
+                if is_hit {
+                    LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
+                    CTRL_TAINTED.store(true, Ordering::Relaxed);
+                    if let Ok(lock) = EVENT_SENDER.lock() {
+                        if let Some(tx) = lock.as_ref() {
+                            let _ = tx.try_send(AppEvent::ToggleLauncher);
+                        }
+                    }
+                    // 注意：不 return LRESULT(1)，让 KEYUP 正常放行!
+                }
             }
         }
     }
@@ -249,5 +268,32 @@ pub fn stop_hook_thread() {
         unsafe {
             let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ctrl_tainted_state_lifecycle() {
+        // 初始状态
+        CTRL_TAINTED.store(false, Ordering::Relaxed);
+        LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
+
+        // 模拟普通按键 (如 'A') 按下：污染状态
+        CTRL_TAINTED.store(true, Ordering::Relaxed);
+        LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
+        assert!(CTRL_TAINTED.load(Ordering::Relaxed));
+
+        // 模拟干净的 Ctrl 按下：重置污染
+        CTRL_TAINTED.store(false, Ordering::Relaxed);
+        assert!(!CTRL_TAINTED.load(Ordering::Relaxed));
+
+        // 模拟 Ctrl 释放命中后：显式封闭状态
+        CTRL_TAINTED.store(true, Ordering::Relaxed);
+        LAST_CTRL_UP_MS.store(0, Ordering::Relaxed);
+        assert!(CTRL_TAINTED.load(Ordering::Relaxed));
+        assert_eq!(LAST_CTRL_UP_MS.load(Ordering::Relaxed), 0);
     }
 }

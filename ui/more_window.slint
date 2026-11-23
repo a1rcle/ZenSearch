@@ -1,0 +1,272 @@
+import { LineEdit, ListView } from "std-widgets.slint";
+import { Theme, SearchItem } from "common.slint";
+
+export component MoreWindow inherits Window {
+    in-out property <string> search_text: "";
+    in-out property <int> selected_index: 0;
+    in-out property <length> scroll_y: 0px;
+    in property <[SearchItem]> result_items: [];
+    in property <int> total_count: 0;
+    in property <string> status_text: "";
+
+    callback query_changed(string);
+    callback item_activated(int);
+    callback item_open_folder(int);
+    callback dismiss();
+
+    public function focus_input() {
+        search_input.focus();
+        search_input.set-selection-offsets(search_input.text.character-count, search_input.text.character-count);
+    }
+
+    public function ensure_selected_visible() {
+        let view_h = 420px;
+        let item_top = root.selected_index * 48px;
+        let item_bottom = item_top + 48px;
+
+        if (item_top < -root.scroll_y) {
+            root.scroll_y = -item_top;
+        } else if (item_bottom > -root.scroll_y + view_h) {
+            root.scroll_y = view_h - item_bottom;
+        }
+    }
+
+    title: "ZenSearch - 更多搜索结果";
+    background: Theme.background;
+    default-font-family: "Segoe UI, Microsoft YaHei, sans-serif";
+    min-width: 680px;
+    min-height: 480px;
+    preferred-width: 900px;
+    preferred-height: 620px;
+
+    forward-focus: search_input;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        // Top Search Header Bar
+        HorizontalLayout {
+            spacing: 10px;
+            height: 42px;
+
+            // Search Icon Pill
+            Rectangle {
+                width: 36px;
+                height: 42px;
+                border-radius: 8px;
+                background: Theme.surface;
+
+                Text {
+                    text: "🔍";
+                    font-size: 16px;
+                    color: Theme.primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Search Input
+            search_input := LineEdit {
+                text <=> root.search_text;
+                placeholder-text: "搜索全部项目 (左键单击打开文件/进入目录，右键单击打开所在文件夹)...";
+                font-size: 15px;
+                horizontal-stretch: 1;
+
+                edited(text) => {
+                    root.selected_index = 0;
+                    root.scroll_y = 0px;
+                    root.query_changed(text);
+                }
+
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.dismiss();
+                        return accept;
+                    }
+                    if (event.text == Key.UpArrow) {
+                        if (root.selected_index > 0) {
+                            root.selected_index -= 1;
+                            root.ensure_selected_visible();
+                        }
+                        return accept;
+                    }
+                    if (event.text == Key.DownArrow) {
+                        if (root.selected_index + 1 < root.result_items.length) {
+                            root.selected_index += 1;
+                            root.ensure_selected_visible();
+                        }
+                        return accept;
+                    }
+                    if (event.text == Key.Return) {
+                        if (root.result_items.length > 0 && root.selected_index >= 0 && root.selected_index < root.result_items.length) {
+                            root.item_activated(root.selected_index);
+                        }
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+
+            // Total Count Badge
+            Rectangle {
+                border-radius: 8px;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    alignment: center;
+                    Text {
+                        text: root.total_count > 0 ? "匹配 " + root.total_count + " 项" : "无匹配项";
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: root.total_count > 0 ? Theme.primary : Theme.text-muted;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Full Results ListView
+        VerticalLayout {
+            vertical-stretch: 1;
+
+            if root.result_items.length > 0 : ListView {
+                content-y <=> root.scroll_y;
+                for item[idx] in root.result_items : Rectangle {
+                    height: 48px;
+                    border-radius: 6px;
+                    background: idx == root.selected_index ? Theme.surface-selected : (row_touch.has-hover ? Theme.surface-hover : Theme.surface);
+
+                    row_touch := TouchArea {
+                        clicked => {
+                            root.selected_index = idx;
+                            root.item_activated(idx);
+                        }
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                                root.selected_index = idx;
+                                root.item_open_folder(idx);
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 12px;
+
+                        // Icon Pill
+                        Rectangle {
+                            width: 28px;
+                            height: 28px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 4px;
+                            background: idx == root.selected_index ? #3E4256 : #2D303E;
+
+                            Image {
+                                source: item.icon;
+                                width: 18px;
+                                height: 18px;
+                                image-fit: contain;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // Filename
+                        Text {
+                            text: item.filename;
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: idx == root.selected_index ? Theme.text : #EAEAEA;
+                            overflow: elide;
+                            max-width: 300px;
+                            vertical-alignment: center;
+                            horizontal-alignment: left;
+                        }
+
+                        // Path
+                        Text {
+                            text: item.path;
+                            font-size: 12px;
+                            color: Theme.text-muted;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            horizontal-alignment: left;
+                        }
+
+                        // Action label on selected
+                        if idx == root.selected_index : Text {
+                            text: "↵ 打开";
+                            font-size: 11px;
+                            color: Theme.accent;
+                            width: 60px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            if root.result_items.length == 0 : Rectangle {
+                border-radius: 8px;
+                background: Theme.surface;
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+
+                    Text {
+                        text: "未找到匹配项";
+                        font-size: 15px;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "请尝试缩短或更换关键词";
+                        font-size: 12px;
+                        color: #6C7086;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Bottom Status / Help Footer
+        Rectangle {
+            height: 32px;
+            border-radius: 6px;
+            background: Theme.surface;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 12px;
+                alignment: center;
+
+                Text {
+                    text: root.status_text != "" ? root.status_text : "💡 操作提示: 鼠标左键：打开文件 / 进入目录 | 鼠标右键：打开所在文件夹 | Esc：关闭窗口";
+                    font-size: 12px;
+                    color: Theme.text-muted;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "ZenSearch";
+                    font-size: 11px;
+                    color: #585B70;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

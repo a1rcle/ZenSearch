@@ -68,3 +68,33 @@ fn test_query_output_semantics() {
     let filenames: Vec<&str> = dummy_output.iter().map(|s| s.filename.as_str()).collect();
     assert_eq!(filenames, vec!["explorer.exe", "notepad.exe"]);
 }
+
+#[test]
+fn test_execute_more_query_empty_handling() {
+    use zensearch::core::everything::execute_more_query;
+
+    let empty = execute_more_query("", 500);
+    assert_eq!(empty.len(), 0);
+    assert_eq!(empty.total_matched, 0);
+
+    let whitespace = execute_more_query("   ", 500);
+    assert_eq!(whitespace.len(), 0);
+    assert_eq!(whitespace.total_matched, 0);
+}
+
+#[test]
+fn test_path_and_name_query_preserves_everything_syntax() {
+    let q = build_effective_query(r"bi_cam\ record");
+    assert_eq!(
+        q,
+        r#"bi_cam\ record !*.lnk !"*\AppData\Roaming\Microsoft\Windows\Recent\*""#
+    );
+}
+
+#[test]
+fn test_increment_run_count_empty_handling() {
+    use zensearch::core::everything::increment_run_count;
+
+    assert_eq!(increment_run_count(""), 0);
+    assert_eq!(increment_run_count("   "), 0);
+}

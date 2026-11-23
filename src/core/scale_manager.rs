@@ -86,8 +86,9 @@ pub fn calculate_launcher_geometry(is_expanded: bool, result_count: usize) -> Sc
 
     let base_height_logical: f32 = 64.0;
     let item_height_logical: f32 = 52.0;
+    let more_btn_height_logical: f32 = 44.0;
     let list_height_logical: f32 = if is_expanded {
-        ((result_count as f32) * item_height_logical).min(400.0) + 12.0
+        ((result_count as f32) * item_height_logical).min(400.0) + 12.0 + more_btn_height_logical
     } else {
         0.0
     };
@@ -99,6 +100,30 @@ pub fn calculate_launcher_geometry(is_expanded: bool, result_count: usize) -> Sc
 
     let x = work.left + (avail_w - phys_w) / 2;
     let y = work.top + (avail_h as f32 * 0.22) as i32;
+
+    ScreenMetrics {
+        x,
+        y,
+        width: phys_w,
+        height: phys_h,
+    }
+}
+
+pub fn calculate_more_window_geometry() -> ScreenMetrics {
+    let (h_monitor, work) = get_focus_monitor_and_work_area();
+    let scale = get_monitor_scale_factor(h_monitor);
+
+    let avail_w = work.right - work.left;
+    let avail_h = work.bottom - work.top;
+
+    let width_logical: f32 = 900.0;
+    let height_logical: f32 = 620.0;
+
+    let phys_w = ((width_logical * scale).round() as i32).min(avail_w - 60);
+    let phys_h = ((height_logical * scale).round() as i32).min(avail_h - 60);
+
+    let x = work.left + (avail_w - phys_w) / 2;
+    let y = work.top + (avail_h - phys_h) / 2;
 
     ScreenMetrics {
         x,
